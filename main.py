@@ -21,10 +21,8 @@ class RNNCell(eqx.Module):
         return jnp.tanh(y_prev @ self.W_hy + x_t @ self.W_xy + self.b)
 
 
-def get_bptt_gradients_fast(model, xs, ys_target):
+def get_bptt_gradients_fast(model, xs, ys_target, y_0):
     params, static = eqx.partition(model, eqx.is_array)
-    hidden_size = model.b.shape[0]
-    y_0 = jnp.zeros((hidden_size,))
 
     def loss_fn_single_step(y, y_target):
         return jnp.sum((y - y_target) ** 2)
@@ -55,10 +53,8 @@ def get_bptt_gradients_fast(model, xs, ys_target):
     return stepwise_grads_pytree
 
 
-def get_bptt_gradients_gt(model, xs, ys_target):
+def get_bptt_gradients_gt(model, xs, ys_target, y_0):
     params, static = eqx.partition(model, eqx.is_array)
-    hidden_size = model.b.shape[0]
-    y_0 = jnp.zeros((hidden_size,))
     num_steps = xs.shape[0]
 
     # --- This function computes the gradient for a SINGLE active step `t` ---
@@ -123,10 +119,10 @@ def benchmark_test():
 
     for steps in steps_to_test:
         # 1. Generate random data for this sequence length
-        key, subkey = jax.random.split(data_key)
-        xs = jax.random.normal(subkey, (steps, input_size))
-        ys_target = jax.random.normal(subkey, (steps, hidden_size))
-        y_0 = jnp.zeros((hidden_size,))
+        key, subkey1, subkey2, subkey3 = jax.random.split(data_key, 4)
+        xs = jax.random.normal(subkey1, (steps, input_size))
+        ys_target = jax.random.normal(subkey2, (steps, hidden_size))
+        y_0 = jax.random.normal(subkey3, (hidden_size,))
 
         # 2. Define the baseline function: total loss over the sequence
         def total_loss_fn(m, xs, ys_target):
@@ -135,7 +131,7 @@ def benchmark_test():
                 return y_curr, y_curr
 
             _, ys = jax.lax.scan(step, y_0, xs)
-            return jnp.mean((ys - ys_target) ** 2)
+            return jnp.sum((ys - ys_target) ** 2)
 
         # 3. Create the JIT-compiled functions to be tested
         # Using eqx.filter_jit is a convenient wrapper around jax.jit for Equinox modules
@@ -144,19 +140,37 @@ def benchmark_test():
 
         # warmup
         baseline_grad_fn_warmup = jitted_baseline_grad_fn(model, xs, ys_target)
-        stepwise_grad_fn_warmup = jitted_stepwise_grad_fn(model, xs, ys_target)
-        jax.tree_util.tree_map(
-            lambda x: x.block_until_ready(),
-            (baseline_grad_fn_warmup, stepwise_grad_fn_warmup),
-        )
+        stepwise_grad_fn_warmup = jitted_stepwise_grad_fn(model, xs, ys_target, y_0)
 
-        baseline_stmt = lambda: jax.tree_util.tree_map(
+        diff = (
+            (
+                (
+                    baseline_grad_fn_warmup.W_hy
+                    - stepwise_grad_fn_warmup.W_hy.sum(axis=0)
+                )
+                ** 2
+            ).sum()
+            + (
+                (
+                    baseline_grad_fn_warmup.W_xy
+                    - stepwise_grad_fn_warmup.W_xy.sum(axis=0)
+                )
+                ** 2
+            ).sum()
+            + (
+                (baseline_grad_fn_warmup.b - stepwise_grad_fn_warmup.b.sum(axis=0)) ** 2
+            ).sum()
+        ).sum()
+
+        assert diff < 1e-4, f"{diff} is too large"
+
+        baseline_stmt = lambda: jax.tree.map(
             lambda x: x.block_until_ready(),
             jitted_baseline_grad_fn(model, xs, ys_target),
         )
-        stepwise_stmt = lambda: jax.tree_util.tree_map(
+        stepwise_stmt = lambda: jax.tree.map(
             lambda x: x.block_until_ready(),
-            jitted_stepwise_grad_fn(model, xs, ys_target),
+            jitted_stepwise_grad_fn(model, xs, ys_target, y_0),
         )
 
         baseline_time_sec, stepwise_time_sec = 0, 0
@@ -168,7 +182,7 @@ def benchmark_test():
                 stepwise_timer = timeit.Timer(stmt=stepwise_stmt)
                 baseline_timer = timeit.Timer(stmt=baseline_stmt)
 
-            if i > 1:
+            if i > 2:
                 baseline_time_sec += (
                     min(
                         baseline_timer.repeat(
@@ -223,12 +237,12 @@ def consistency_test():
 
     # 1. Get stepwise gradients from our method
     print("Computing stepwise gradients using get_bptt_gradients_fast...")
-    stepwise_grads = get_bptt_gradients_fast(model, xs, ys_target)
+    stepwise_grads = get_bptt_gradients_fast(model, xs, ys_target, y_0)
 
     # 2. Compute individual gradients for each timestep
     print("Computing individual per-timestep gradients...")
 
-    individual_grads = get_bptt_gradients_gt(model, xs, ys_target)
+    individual_grads = get_bptt_gradients_gt(model, xs, ys_target, y_0)
 
     # 4. Print all gradients
     print("\n" + "=" * 70)
@@ -244,7 +258,7 @@ def consistency_test():
     print("OUR METHOD GRADIENTS (from get_bptt_gradients_fast)")
     print("=" * 70)
     print(
-        f"\nShape of returned gradients: {jax.tree_util.tree_map(lambda x: x.shape, stepwise_grads)}"
+        f"\nShape of returned gradients: {jax.tree.map(lambda x: x.shape, stepwise_grads)}"
     )
     for t in range(steps):
         print(f"\nTimestep {t}:")
