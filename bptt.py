@@ -93,10 +93,46 @@ def get_bptt_gradients_gt(model, xs, ys_target, y_0):
     return stepwise_grads_pytree
 
 
+def get_bptt_gradients_stacked(model, xs, ys_target, y_0):
+    """
+    Computes stepwise gradients using a stacked model approach.
+    Each timestep uses its own copy of parameters (stacked along axis 0).
+    """
+    params, static = eqx.partition(model, eqx.is_array)
+    num_steps = xs.shape[0]
+
+    # Stack parameters: repeat for each timestep
+    stacked_params = jax.tree.map(
+        lambda p: jnp.repeat(p[None, ...], num_steps, axis=0), params
+    )
+
+    def loss_fn(stacked_p):
+        def step_body(y_prev, scan_inputs):
+            x_t, i = scan_inputs
+
+            # Extract parameters for this timestep
+            p_t = jax.tree.map(lambda arr: arr[i], stacked_p)
+
+            # Reconstruct model and compute forward step
+            model_t = eqx.combine(p_t, static)
+            y_curr = model_t(y_prev, x_t)
+            return y_curr, y_curr
+
+        indices = jnp.arange(num_steps)
+        _, ys_pred = jax.lax.scan(step_body, y_0, (xs, indices))
+
+        return jnp.sum((ys_pred - ys_target) ** 2)
+
+    # Compute gradient wrt stacked parameters
+    stepwise_grads = eqx.filter_grad(loss_fn)(stacked_params)
+
+    return stepwise_grads
+
+
 def benchmark_test():
     steps_to_test = [10, 20, 50, 100, 200, 400, 800, 1600, 2400]
-    input_size = 32
-    hidden_size = 64
+    input_size = 64
+    hidden_size = 128
 
     number_of_runs = 8
     number_of_repeats = 4
@@ -107,15 +143,15 @@ def benchmark_test():
     # --- Initialize Model ---
     model = RNNCell(input_size, hidden_size, key=model_key)
 
-    print("=" * 70)
+    print("=" * 90)
     print("Complex & Rigorous Benchmark: Equinox RNN BPTT")
     print(f"Model: input={input_size}, hidden={hidden_size}")
-    print(f"Comparing standard `eqx.filter_grad` vs. our `get_bptt_gradients_fast`")
-    print("=" * 70)
+    print(f"Comparing three approaches: Baseline, Fast BPTT, and Stacked Model")
+    print("=" * 90)
     print(
-        f"{'Steps (T)':<10} | {'Baseline (ms)':<15} | {'Stepwise (ms)':<15} | {'Ratio':<10}"
+        f"{'Steps (T)':<10} | {'Baseline (ms)':<15} | {'Fast (ms)':<15} | {'Stacked (ms)':<15} | {'Fast/Base':<10} | {'Stack/Base':<10}"
     )
-    print("-" * 70)
+    print("-" * 90)
 
     for steps in steps_to_test:
         # 1. Generate random data for this sequence length
@@ -137,12 +173,15 @@ def benchmark_test():
         # Using eqx.filter_jit is a convenient wrapper around jax.jit for Equinox modules
         jitted_baseline_grad_fn = eqx.filter_jit(eqx.filter_grad(total_loss_fn))
         jitted_stepwise_grad_fn = eqx.filter_jit(get_bptt_gradients_fast)
+        jitted_stacked_grad_fn = eqx.filter_jit(get_bptt_gradients_stacked)
 
         # warmup
         baseline_grad_fn_warmup = jitted_baseline_grad_fn(model, xs, ys_target)
         stepwise_grad_fn_warmup = jitted_stepwise_grad_fn(model, xs, ys_target, y_0)
+        stacked_grad_fn_warmup = jitted_stacked_grad_fn(model, xs, ys_target, y_0)
 
-        diff = (
+        # Verify fast method
+        diff_fast = (
             (
                 (
                     baseline_grad_fn_warmup.W_hy
@@ -162,7 +201,23 @@ def benchmark_test():
             ).sum()
         ).sum()
 
-        assert diff < 1e-4, f"{diff} is too large"
+        # Verify stacked method
+        diff_stacked = (
+            (
+                (baseline_grad_fn_warmup.W_hy - stacked_grad_fn_warmup.W_hy.sum(axis=0))
+                ** 2
+            ).sum()
+            + (
+                (baseline_grad_fn_warmup.W_xy - stacked_grad_fn_warmup.W_xy.sum(axis=0))
+                ** 2
+            ).sum()
+            + (
+                (baseline_grad_fn_warmup.b - stacked_grad_fn_warmup.b.sum(axis=0)) ** 2
+            ).sum()
+        ).sum()
+
+        assert diff_fast < 1e-4, f"Fast method diff {diff_fast} is too large"
+        assert diff_stacked < 1e-4, f"Stacked method diff {diff_stacked} is too large"
 
         baseline_stmt = lambda: jax.tree.map(
             lambda x: x.block_until_ready(),
@@ -172,40 +227,42 @@ def benchmark_test():
             lambda x: x.block_until_ready(),
             jitted_stepwise_grad_fn(model, xs, ys_target, y_0),
         )
-
-        baseline_time_sec, stepwise_time_sec = 0, 0
-        for i in range(8):
-            if random.random() > 0.5:
-                baseline_timer = timeit.Timer(stmt=baseline_stmt)
-                stepwise_timer = timeit.Timer(stmt=stepwise_stmt)
-            else:
-                stepwise_timer = timeit.Timer(stmt=stepwise_stmt)
-                baseline_timer = timeit.Timer(stmt=baseline_stmt)
-
-            if i > 2:
-                baseline_time_sec += (
-                    min(
-                        baseline_timer.repeat(
-                            repeat=number_of_repeats, number=number_of_runs
-                        )
-                    )
-                    / number_of_runs
-                )
-                stepwise_time_sec += (
-                    min(
-                        stepwise_timer.repeat(
-                            repeat=number_of_repeats, number=number_of_runs
-                        )
-                    )
-                    / number_of_runs
-                )
-
-        ratio = stepwise_time_sec / baseline_time_sec
-        print(
-            f"{steps:<10} | {baseline_time_sec * 1000:<15.4f} | {stepwise_time_sec * 1000:<15.4f} | {ratio:<10.2f}"
+        stacked_stmt = lambda: jax.tree.map(
+            lambda x: x.block_until_ready(),
+            jitted_stacked_grad_fn(model, xs, ys_target, y_0),
         )
 
-    print("=" * 70)
+        baseline_time_sec, stepwise_time_sec, stacked_time_sec = 0, 0, 0
+        for i in range(8):
+            # Randomize order to reduce systematic bias
+            order = [baseline_stmt, stepwise_stmt, stacked_stmt]
+            random.shuffle(order)
+            timers = [timeit.Timer(stmt=stmt) for stmt in order]
+
+            if i > 2:  # Warmup first few iterations
+                for timer, stmt in zip(timers, order):
+                    time_result = (
+                        min(
+                            timer.repeat(
+                                repeat=number_of_repeats, number=number_of_runs
+                            )
+                        )
+                        / number_of_runs
+                    )
+                    if stmt == baseline_stmt:
+                        baseline_time_sec += time_result
+                    elif stmt == stepwise_stmt:
+                        stepwise_time_sec += time_result
+                    else:
+                        stacked_time_sec += time_result
+
+        ratio_fast = stepwise_time_sec / baseline_time_sec
+        ratio_stacked = stacked_time_sec / baseline_time_sec
+        print(
+            f"{steps:<10} | {baseline_time_sec * 1000:<15.4f} | {stepwise_time_sec * 1000:<15.4f} | {stacked_time_sec * 1000:<15.4f} | {ratio_fast:<10.2f} | {ratio_stacked:<10.2f}"
+        )
+
+    print("=" * 90)
 
 
 def consistency_test():
@@ -241,8 +298,11 @@ def consistency_test():
 
     # 2. Compute individual gradients for each timestep
     print("Computing individual per-timestep gradients...")
-
     individual_grads = get_bptt_gradients_gt(model, xs, ys_target, y_0)
+
+    # 3. Compute gradients using stacked model approach
+    print("Computing stepwise gradients using stacked model...")
+    stacked_grads = get_bptt_gradients_stacked(model, xs, ys_target, y_0)
 
     # 4. Print all gradients
     print("\n" + "=" * 70)
@@ -255,7 +315,7 @@ def consistency_test():
         print(f"  b[0]:      {individual_grads.b[t, 0]:.6f}")
 
     print("\n" + "=" * 70)
-    print("OUR METHOD GRADIENTS (from get_bptt_gradients_fast)")
+    print("FAST METHOD GRADIENTS (from get_bptt_gradients_fast)")
     print("=" * 70)
     print(
         f"\nShape of returned gradients: {jax.tree.map(lambda x: x.shape, stepwise_grads)}"
@@ -265,6 +325,18 @@ def consistency_test():
         print(f"  W_hy[0,0]: {stepwise_grads.W_hy[t, 0, 0]:.6f}")
         print(f"  W_xy[0,0]: {stepwise_grads.W_xy[t, 0, 0]:.6f}")
         print(f"  b[0]:      {stepwise_grads.b[t, 0]:.6f}")
+
+    print("\n" + "=" * 70)
+    print("STACKED MODEL GRADIENTS (from get_bptt_gradients_stacked)")
+    print("=" * 70)
+    print(
+        f"\nShape of returned gradients: {jax.tree.map(lambda x: x.shape, stacked_grads)}"
+    )
+    for t in range(steps):
+        print(f"\nTimestep {t}:")
+        print(f"  W_hy[0,0]: {stacked_grads.W_hy[t, 0, 0]:.6f}")
+        print(f"  W_xy[0,0]: {stacked_grads.W_xy[t, 0, 0]:.6f}")
+        print(f"  b[0]:      {stacked_grads.b[t, 0]:.6f}")
 
 
 if __name__ == "__main__":
