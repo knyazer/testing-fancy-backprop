@@ -113,24 +113,39 @@ def evaluate_dataset(
 
 
 def decode_hyperparams(raw_values: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    raw_values = jnp.asarray(raw_values, dtype=jnp.float32).reshape(-1)
+    raw_values = jnp.nan_to_num(raw_values, nan=0.0, posinf=20.0, neginf=-20.0)
+
+    num_values = int(min(raw_values.shape[0], 3))
+    raw_values = raw_values[:num_values]
+    raw_values = jnp.pad(raw_values, (0, 3 - num_values))
+
     lr = jnp.exp(raw_values[0])
-    if len(raw_values) == 1:
-        return lr, 0.9, 1e-5
     momentum = jax.nn.sigmoid(raw_values[1])
-    if len(raw_values) == 2:
-        return lr, momentum, 1e-5
     reg = jnp.exp(raw_values[2])
+
+    if num_values == 1:
+        return lr, 0.9, 1e-5
+    if num_values == 2:
+        return lr, momentum, 1e-5
     return lr, momentum, reg
 
 
 def encode_hyperparams(
     lr: float, momentum: float = None, reg: float = None
 ) -> jax.Array:
-    out = [jnp.log(lr)]
+    tiny = jnp.float32(1e-12)
+    lr_safe = jnp.clip(jnp.asarray(lr, dtype=jnp.float32), tiny, None)
+
+    out = [jnp.log(lr_safe)]
     if momentum is not None:
-        out.append(jnp.log(momentum) - jnp.log1p(-momentum))
+        momentum_safe = jnp.clip(
+            jnp.asarray(momentum, dtype=jnp.float32), tiny, 1.0 - tiny
+        )
+        out.append(jnp.log(momentum_safe) - jnp.log1p(-momentum_safe))
     if reg is not None:
-        out.append(jnp.log(reg))
+        reg_safe = jnp.clip(jnp.asarray(reg, dtype=jnp.float32), tiny, None)
+        out.append(jnp.log(reg_safe))
     return jnp.array(out, dtype=jnp.float32)
 
 
