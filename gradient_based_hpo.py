@@ -1,5 +1,5 @@
 import argparse
-from typing import Tuple
+from typing import Any, Tuple
 
 import equinox as eqx
 import equinox.nn as nn
@@ -198,7 +198,7 @@ def objective_fn(
 def run_hpo(args):
     key = jr.PRNGKey(args.seed)
 
-    data_key, model_key, objective_key = jr.split(key, 3)
+    data_key, model_key = jr.split(key, 2)
     train_images, train_labels, val_images, val_labels = load_mnist_arrays(
         args.num_train, args.num_val
     )
@@ -215,28 +215,23 @@ def run_hpo(args):
 
     model = SimpleCNN(height, width, num_classes, key=model_key)
 
-    outer_params = encode_hyperparams(args.init_lr, args.init_momentum)
-    outer_optimizer = build_outer_optimizer(args.outer_optimizer, args.outer_lr)
-    outer_opt_state = outer_optimizer.init(outer_params)
-
-    wrapped_objective_fn = eqx.Partial(
-        objective_fn,
-        outer_batch_size=args.outer_batch,
-        inner_batch_size=args.inner_batch,
-        init_model=model,
+    problem = GradientBasedHPO(
+        model=model,
         train_data=(train_images, train_targets),
         val_data=(val_images, val_targets),
         num_steps=args.inner_steps,
-        key=objective_key,
+        batch_size=args.inner_batch,
     )
 
-    for step in range(args.outer_steps):
-        val_loss, grads = eqx.filter_value_and_grad(wrapped_objective_fn)(outer_params)
+    outer_params = encode_hyperparams(args.init_lr, args.init_momentum, args.init_reg)
+    outer_optimizer = SGD(args.outer_lr)
 
-        updates, outer_opt_state = outer_optimizer.update(
-            grads, outer_opt_state, outer_params
-        )
-        outer_params = optax.apply_updates(outer_params, updates)
+    outer_objective = eqx.filter_jit(problem.objective)
+
+    for step in range(args.outer_steps):
+        val_loss = outer_objective(outer_params)
+        updates = outer_optimizer.update(problem, outer_params)
+        outer_params = jax.tree.map(lambda p, u: p + u, outer_params, updates)
 
         lr, momentum, reg = decode_hyperparams(outer_params)
         print(
@@ -245,13 +240,13 @@ def run_hpo(args):
             f"lr={float(lr):.5f} reg={float(reg):.6f} momentum={float(momentum):.3f}"
         )
 
-    final_loss = wrapped_objective_fn(outer_params)
-    outer_params = decode_hyperparams(outer_params)
+    final_loss = outer_objective(outer_params)
+    decoded_params = decode_hyperparams(outer_params)
     print(
         "\nFinal hyperparameters: "
-        f"lr={float(outer_params[0]):.5f}, "
-        f"reg={float(outer_params[1]):.6f}, "
-        f"momentum={float(outer_params[2]):.3f}"
+        f"lr={float(decoded_params[0]):.5f}, "
+        f"reg={float(decoded_params[2]):.6f}, "
+        f"momentum={float(decoded_params[1]):.3f}"
     )
     print(f"Validation metrics: loss={float(final_loss):.6f}")
 
@@ -266,13 +261,13 @@ def build_parser():
     parser.add_argument(
         "--num-train",
         type=int,
-        default=40_000,
+        default=4_000,
         help="number of MNIST samples used to construct the training set",
     )
     parser.add_argument(
         "--num-val",
         type=int,
-        default=10_000,
+        default=1_000,
         help="number of MNIST samples set aside for validation",
     )
     parser.add_argument(
@@ -284,7 +279,7 @@ def build_parser():
     parser.add_argument(
         "--inner-steps",
         type=int,
-        default=200,
+        default=500,
         help="number of inner optimization iterations per model",
     )
     parser.add_argument(
@@ -296,13 +291,13 @@ def build_parser():
     parser.add_argument(
         "--outer-batch",
         type=int,
-        default=1,
+        default=4,
         help="count of independent inner trainings averaged per outer step",
     )
     parser.add_argument(
         "--outer-lr",
         type=float,
-        default=0.1,
+        default=100.0,
         help="learning rate used by the outer optimizer",
     )
     parser.add_argument(
@@ -350,20 +345,27 @@ class Problem(eqx.Module):
 
     # defines common methods to interact with the thing in question
     def step(self, state, problem_params):
-        # here one would define:
-        # for metalearning: given last iterate (inner params), and hyperparameters (outer params) what's the next iterate?
-        # for reinforcement learning: given last iterate (system state) and model, what's the next state of the system?
-        # for rnn's 'copy sequence' task: given the last state of the rnn, what's the new rnn state?
+        # returns (new_state, step_loss)
+        # - step_loss is the per-step contribution collected by the scan
         raise NotImplementedError
 
-    def is_done(self, state):
-        # checks if particular state corresponds to a 'completed' run, so we can run 'loss' on top of it
+    def loss(self, step_losses, state):
+        # given per-step losses (scan outputs) and final state, what's the scalar loss?
         raise NotImplementedError
 
-    def loss(self, states, mask):
-        # given all the states observed, what's the loss?
-        # mask masks out all the states past being done
-        raise NotImplementedError
+    def objective(self, problem_params):
+        init_state = self.initial_state()
+
+        def body(carry, _):
+            state = carry
+            state, step_loss = self.step(state, problem_params)
+            return state, step_loss
+
+        rematted_body = jax.checkpoint(body)
+        final_state, step_losses = jax.lax.scan(
+            rematted_body, init_state, jnp.arange(self.max_steps)
+        )
+        return self.loss(step_losses, final_state)
 
     def initial_state(self):
         # generates the initial state based off whatever you want
@@ -382,18 +384,127 @@ class Optimizer:
         # e.g. something like:
         # def to_grad(problem_params):
         #   state = problem.initial_state()
-        #   states = []
-        #   mask = []
         #   for i in range(problem.max_steps):
-        #     state, is_done = problem.step(state, problem_params)
-        #     states.append(state)
-        #     mask.append(is_done)
-        #   return problem.loss(states, mask)
+        #     state, _ = problem.step(state, problem_params)
+        #   return problem.loss(state)
         # return -learning_rate * jax.grad(to_grad)(problem_params)
         raise NotImplementedError
 
+
+class SGD(Optimizer):
+    learning_rate: jax.Array
+
+    def __init__(self, learning_rate: float | jax.Array):
+        self.learning_rate = jnp.asarray(learning_rate, dtype=jnp.float32)
+
+    def update(self, problem: Problem, problem_params):
+        grads = jax.grad(problem.objective)(problem_params)
+        return jax.tree.map(lambda g: -self.learning_rate * g, grads)
+
+
+class TrainState(eqx.Module):
+    params: Any
+    momentum: Any
+    step: jax.Array
+
+
 class GradientBasedHPO(Problem):
-    # TODO
+    train_inputs: jax.Array
+    train_targets: jax.Array
+    val_inputs: jax.Array
+    val_targets: jax.Array
+    model_static: Any = eqx.field(static=True)
+    initial_params: Any
+    initial_momentum: Any
+    max_steps: int = eqx.field(static=True)
+    batch_size: int = eqx.field(static=True)
+
+    def __init__(
+        self,
+        model: SimpleCNN,
+        train_data: tuple[jax.Array, jax.Array],
+        val_data: tuple[jax.Array, jax.Array],
+        num_steps: int,
+        batch_size: int,
+    ):
+        params, static = eqx.partition(model, eqx.is_inexact_array)
+        self.initial_params = params
+        self.initial_momentum = jax.tree.map(jnp.zeros_like, params)
+        self.model_static = static
+        self.train_inputs, self.train_targets = train_data
+        self.val_inputs, self.val_targets = val_data
+        self.max_steps = num_steps
+        self.batch_size = batch_size
+
+    def _train_loss(self, params, reg_scale, batch_inputs, batch_targets):
+        model = eqx.combine(params, self.model_static)
+        preds = jax.vmap(model)(batch_inputs)
+        data_loss = jnp.mean(jnp.sum((preds - batch_targets) ** 2, axis=-1))
+
+        def l2_sum(tree):
+            return jax.tree_util.tree_reduce(
+                lambda acc, x: acc + jnp.sum(x**2),
+                tree,
+                jnp.array(0.0, dtype=jnp.float32),
+            )
+
+        reg_loss = reg_scale * l2_sum(params)
+        return data_loss + reg_loss
+
+    def _val_loss(self, params):
+        model = eqx.combine(params, self.model_static)
+        preds = eqx.filter_vmap(model)(self.val_inputs)
+        return jnp.mean(jnp.sum((preds - self.val_targets) ** 2, axis=-1))
+
+    def initial_state(self):
+        return TrainState(
+            params=self.initial_params,
+            momentum=self.initial_momentum,
+            step=jnp.array(0, dtype=jnp.int32),
+        )
+
+    def objective(self, problem_params):
+        num_batches = self.train_inputs.shape[0] // self.batch_size
+        batched_inputs = self.train_inputs[: num_batches * self.batch_size].reshape(
+            num_batches, self.batch_size, *self.train_inputs.shape[1:]
+        )
+        batched_targets = self.train_targets[: num_batches * self.batch_size].reshape(
+            num_batches, self.batch_size, *self.train_targets.shape[1:]
+        )
+
+        init_state = self.initial_state()
+
+        def body(state, batch):
+            batch_inputs, batch_targets = batch
+            return self.step(state, problem_params, batch_inputs, batch_targets), None
+
+        final_state, step_losses = jax.lax.scan(
+            jax.checkpoint(body), init_state, (batched_inputs, batched_targets)
+        )
+        return self.loss(step_losses, final_state)
+
+    def step(self, state, problem_params, batch_inputs, batch_targets):
+        lr, momentum, reg = decode_hyperparams(problem_params)
+
+        step_loss, grads = eqx.filter_value_and_grad(
+            lambda p: self._train_loss(p, reg, batch_inputs, batch_targets),
+        )(state.params)
+
+        new_momentum = jax.tree.map(
+            lambda m, g: momentum * m + g, state.momentum, grads
+        )
+        new_params = jax.tree.map(
+            lambda p, m: p - lr * m,
+            state.params,
+            new_momentum,
+        )
+        new_step = state.step + 1
+
+        return TrainState(params=new_params, momentum=new_momentum, step=new_step)
+
+    def loss(self, step_losses: jax.Array, state: TrainState):
+        return self._val_loss(state.params)
+
 
 if __name__ == "__main__":
     arg_parser = build_parser()
