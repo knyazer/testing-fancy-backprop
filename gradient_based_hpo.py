@@ -369,18 +369,7 @@ class Problem(eqx.Module):
         raise NotImplementedError
 
     def objective(self, problem_params):
-        init_state = self.initial_state()
-
-        def body(carry, _):
-            state = carry
-            state, step_loss = self.step(state, problem_params)
-            return state, step_loss
-
-        rematted_body = jax.checkpoint(body)
-        final_state, step_losses = jax.lax.scan(
-            rematted_body, init_state, jnp.arange(self.max_steps)
-        )
-        return self.loss(step_losses, final_state)
+        raise NotImplementedError
 
     def initial_state(self):
         # generates the initial state based off whatever you want
@@ -404,6 +393,88 @@ class Optimizer:
         #   return problem.loss(state)
         # return -learning_rate * jax.grad(to_grad)(problem_params)
         raise NotImplementedError
+
+    def objective(self, problem_params):
+        num_batches = self.train_inputs.shape[0] // self.batch_size
+        batched_inputs = self.train_inputs[: num_batches * self.batch_size].reshape(
+            num_batches, self.batch_size, *self.train_inputs.shape[1:]
+        )
+        batched_targets = self.train_targets[: num_batches * self.batch_size].reshape(
+            num_batches, self.batch_size, *self.train_targets.shape[1:]
+        )
+
+        init_state = self.initial_state()
+
+        def body(state, batch):
+            batch_inputs, batch_targets = batch
+            return self.step(state, problem_params, batch_inputs, batch_targets), None
+
+        final_state, step_losses = jax.lax.scan(
+            jax.checkpoint(body), init_state, (batched_inputs, batched_targets)
+        )
+        return self.loss(step_losses, final_state)
+
+
+def problem_grad(
+    problem, windowing: int = -1, expanded: bool = False, filter=eqx.is_inexact_array
+):
+    def fn(params: eqx.Module, init_args: Any):
+        params_dyn, params_st = eqx.partition(params, filter)
+        init_state = problem.init_state(*init_args)
+
+        def body(state, xs_i):
+            stepwise_aux, step_idx = xs_i
+            if windowing != -1:
+                state = jax.lax.cond(
+                    jnp.mod(step_idx, windowing) == windowing - 1,
+                    lambda: jax.lax.stop_gradient(state),
+                    lambda: state,
+                )
+            new_state, aux = problem.step(state, params, stepwise_aux)
+            loss = problem.single_step_loss(new_state, step_idx=step_idx)
+            return new_state, (state, aux, loss)
+
+        xs = (problem.stepwise_data(), jnp.arange(problem.max_steps))
+        last_state, (past_states, aux, losses) = jax.lax.scan(body, init_state, xs)
+
+        total_loss = jnp.sum(losses)
+
+        # if we are not expanded -> we do filter_and_grad wrap over loss value
+        if not expanded:
+            return total_loss
+
+        # if we are expanded -> use hand-crafted backprop
+        def backward_body(grad_carry, scan_inputs):
+            state, stepwise_aux, step_idx = scan_inputs
+            new_state, step_aux = problem.step(state, params, stepwise_aux)
+
+            grad_from_loss = problem.single_loss(new_state, step_idx=step_idx)
+            grad_total = jax.tree.map(
+                lambda g1, g2: g1 + g2, grad_carry, grad_from_loss
+            )
+            vjp_fn = eqx.filter_vjp(  # ??
+                lambda s, p: problem.single_step_loss(
+                    problem.step(s, eqx.combine(p, params_st), stepwise_aux)[0],
+                    step_idx=step_idx,
+                ),
+                state,
+                params_dyn,
+            )[1]
+            grad_for_params, grad_for_state = vjp_fn(grad_total)
+
+            return grad_for_state, grad_for_params
+
+        grad_init = jnp.tree.map(lambda t: jnp.zeros_like(t), params_dyn)
+        _, stepwise_grads_pytree = jax.lax.scan(
+            backward_body, grad_init, (past_states, *xs), reverse=True
+        )
+
+        return total_loss, stepwise_grads_pytree
+
+    if not expanded:
+        return eqx.filter_jit(fn)
+    else:
+        return eqx.filter_value_and_grad(fn)
 
 
 class SGD(Optimizer):
