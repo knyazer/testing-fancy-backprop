@@ -8,6 +8,22 @@ import opts
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+from matplotlib import pyplot as plt
+
+# Hyperparameter optimization constants
+NUM_TRAIN = 4_000
+NUM_VAL = 100
+INNER_BATCH = 32
+LOSS_INTERVAL = 100
+INNER_STEPS = 1000
+OUTER_STEPS = 20
+OUTER_BATCH = 4
+OUTER_LR = 0.005
+OUTER_OPTIMIZER = "adam"
+INIT_LR = 0.01
+INIT_REG = 1e-4
+INIT_MOMENTUM = 0.8
+SEED = 0
 
 
 class SimpleCNN(eqx.Module):
@@ -17,7 +33,15 @@ class SimpleCNN(eqx.Module):
     height: int = eqx.field(static=True)
     width: int = eqx.field(static=True)
 
-    def __init__(self, height: int, width: int, num_classes: int, *, key: jax.Array):
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        num_classes: int,
+        *,
+        key: jax.Array,
+        weight_scale: float = 1.0,
+    ):
         k1, k2, k3 = jr.split(key, 3)
         self.conv1 = nn.Conv2d(
             in_channels=1,
@@ -39,6 +63,18 @@ class SimpleCNN(eqx.Module):
         self.linear = nn.Linear(4 * height * width, num_classes, key=k3)
         self.height = height
         self.width = width
+
+        # Scale weights to trigger gradient explosion
+        if weight_scale != 1.0:
+            self.conv1 = eqx.tree_at(
+                lambda m: m.weight, self.conv1, self.conv1.weight * weight_scale
+            )
+            self.conv2 = eqx.tree_at(
+                lambda m: m.weight, self.conv2, self.conv2.weight * weight_scale
+            )
+            self.linear = eqx.tree_at(
+                lambda m: m.weight, self.linear, self.linear.weight * weight_scale
+            )
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = x[None, ...]  # (28, 28) -> (1, 28, 28)
@@ -77,49 +113,41 @@ def preprocess_images(images: jax.Array) -> jax.Array:
     return images / scale
 
 
-def decode_hyperparams(raw_values: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
-    raw_values = jnp.asarray(raw_values, dtype=jnp.float32).reshape(-1)
-    raw_values = jnp.nan_to_num(raw_values, nan=0.0, posinf=20.0, neginf=-20.0)
-
-    num_values = int(min(raw_values.shape[0], 3))
-    raw_values = raw_values[:num_values]
-    raw_values = jnp.pad(raw_values, (0, 3 - num_values))
-
-    lr = jnp.exp(raw_values[0])
-    momentum = jax.nn.sigmoid(raw_values[1])
-    reg = jnp.exp(raw_values[2])
-
-    if num_values == 1:
-        return lr, 0.9, 1e-5
-    if num_values == 2:
-        return lr, momentum, 1e-5
-    return lr, momentum, reg
+def decode_hyperparams(values: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
+    values = jnp.asarray(values, dtype=jnp.float32).reshape(-1)
+    values = jnp.pad(values, (0, max(0, 3 - values.shape[0])))[:3]
+    return values[0], values[1], values[2]
 
 
 def encode_hyperparams(
     lr: float, momentum: float = None, reg: float = None
 ) -> jax.Array:
-    tiny = jnp.float32(1e-12)
-    lr_safe = jnp.clip(jnp.asarray(lr, dtype=jnp.float32), tiny, None)
-
-    out = [jnp.log(lr_safe)]
+    out = [lr]
     if momentum is not None:
-        momentum_safe = jnp.clip(
-            jnp.asarray(momentum, dtype=jnp.float32), tiny, 1.0 - tiny
-        )
-        out.append(jnp.log(momentum_safe) - jnp.log1p(-momentum_safe))
+        out.append(momentum)
     if reg is not None:
-        reg_safe = jnp.clip(jnp.asarray(reg, dtype=jnp.float32), tiny, None)
-        out.append(jnp.log(reg_safe))
+        out.append(reg)
     return jnp.array(out, dtype=jnp.float32)
 
 
+def project_hyperparams(values: jax.Array) -> jax.Array:
+    values = jnp.asarray(values, dtype=jnp.float32).reshape(-1)
+    values = jnp.pad(values, (0, max(0, 3 - values.shape[0])))[:3]
+    return jnp.array(
+        [
+            jnp.clip(values[0], 1e-8, 1.0),  # lr
+            jnp.clip(values[1], 0.0, 0.999),  # momentum
+            jnp.clip(values[2], 1e-8, 1.0),  # reg
+        ]
+    )
+
+
 def run_hpo(args):
-    key = jr.PRNGKey(args.seed)
+    key = jr.PRNGKey(SEED)
 
     data_key, model_key = jr.split(key, 2)
     train_images, train_labels, val_images, val_labels = load_mnist_arrays(
-        args.num_train, args.num_val
+        NUM_TRAIN, NUM_VAL
     )
 
     num_classes = int(jnp.max(train_labels) - jnp.min(train_labels)) + 1
@@ -132,28 +160,65 @@ def run_hpo(args):
 
     height, width = train_images.shape[1], train_images.shape[2]
 
-    model = SimpleCNN(height, width, num_classes, key=model_key)
+    model = SimpleCNN(
+        height, width, num_classes, key=model_key, weight_scale=args.weight_scale
+    )
 
     problem = GradientBasedHPO(
         model=model,
         train_data=(train_images, train_targets),
         val_data=(val_images, val_targets),
-        num_steps=args.inner_steps,
-        batch_size=args.inner_batch,
+        num_steps=INNER_STEPS,
+        batch_size=INNER_BATCH,
         key=jr.key(0),
+        loss_interval=args.loss_interval,
     )
 
-    outer_params = encode_hyperparams(args.init_lr, args.init_momentum, args.init_reg)
-    outer_optimizer = SGD(args.outer_lr)
+    outer_params = encode_hyperparams(INIT_LR, INIT_MOMENTUM, INIT_REG)
 
-    for step in range(args.outer_steps):
-        v1, g1 = problem.grad()(outer_params)
-        v3, g3 = problem.grad(windowing=10)(outer_params)
-        v4, g4 = problem.grad(windowing=10, expanded=True)(outer_params)
-        print(g4.sum(axis=0), "expanded")
-        print("should be equal to ", g3)
-        print("should _not_ be equal to", g1)
-        breakpoint()
+    if OUTER_OPTIMIZER == "adam":
+        outer_opt = opts.adam(OUTER_LR)
+    else:
+        outer_opt = opts.sgd(OUTER_LR, momentum=0.0)
+
+    outer_opt_state = outer_opt.init(outer_params)
+
+    import os
+
+    image_dir = os.path.join("images", args.prefix) if args.prefix else "images"
+    os.makedirs(image_dir, exist_ok=True)
+
+    for step in range(OUTER_STEPS):
+        val_loss, grads = problem.grad(windowing=args.windowing, expanded=True)(
+            outer_params,
+            init_params=None,  # set the key here, the env is stoch
+        )
+
+        pretty_grads = []
+        for i in range(len(grads)):
+            norm = jnp.sum(jnp.abs(grads[i]))
+            pretty_grads.append(norm)
+        pretty_grads = jnp.array(pretty_grads)
+        plt.figure()
+        plt.plot(pretty_grads)
+        plt.savefig(f"{image_dir}/{step}_gradient_norms.png")
+        plt.close()
+
+        grads_for_upd = grads.sum(axis=0)
+        updates, outer_opt_state = outer_opt.update(
+            grads_for_upd, outer_opt_state, outer_params
+        )
+        decoded_params = decode_hyperparams(outer_params)
+        print(
+            "\nHyperparameters: "
+            f"lr={float(decoded_params[0]):.4f}, "
+            f"reg={float(decoded_params[2]):.4f}, "
+            f"momentum={float(decoded_params[1]):.3f}\n"
+            f"Had Loss Of: {val_loss:.5f}"
+        )
+
+        outer_params = jax.tree.map(lambda p, u: p + u, outer_params, updates)
+        outer_params = project_hyperparams(outer_params)
 
     decoded_params = decode_hyperparams(outer_params)
     print(
@@ -172,81 +237,30 @@ def build_parser():
         )
     )
     parser.add_argument(
-        "--num-train",
-        type=int,
-        default=4_000,
-        help="number of MNIST samples used to construct the training set",
-    )
-    parser.add_argument(
-        "--num-val",
-        type=int,
-        default=1_000,
-        help="number of MNIST samples set aside for validation",
-    )
-    parser.add_argument(
-        "--inner-batch",
-        type=int,
-        default=32,
-        help="mini-batch size consumed by each inner SGD step",
-    )
-    parser.add_argument(
-        "--inner-steps",
-        type=int,
-        default=500,
-        help="number of inner optimization iterations per model",
-    )
-    parser.add_argument(
-        "--outer-steps",
-        type=int,
-        default=1000,
-        help="how many outer hyperparameter updates to perform",
-    )
-    parser.add_argument(
-        "--outer-batch",
-        type=int,
-        default=4,
-        help="count of independent inner trainings averaged per outer step",
-    )
-    parser.add_argument(
-        "--outer-lr",
+        "--weight-scale",
         type=float,
-        default=100.0,
-        help="learning rate used by the outer optimizer",
+        default=1.0,
+        help="scale initial network weights to trigger gradient explosion (e.g., 5.0 or 10.0)",
     )
     parser.add_argument(
-        "--outer-optimizer",
+        "--windowing",
+        type=int,
+        default=-1,
+        help="truncate gradients every N steps (-1 for no truncation)",
+    )
+    parser.add_argument(
+        "--prefix",
         type=str,
-        choices=["sgd", "adam"],
-        default="adam",
-        help="outer optimizer applied to the raw hyperparameters",
+        default="",
+        help="subdirectory prefix for saving images (e.g., 'exp1' saves to images/exp1/)",
     )
     parser.add_argument(
-        "--init-lr", type=float, default=0.0005, help="initial inner learning rate"
-    )
-    parser.add_argument(
-        "--init-reg",
-        type=float,
-        default=1e-4,
-        help="initial weight decay (L2 regularization) scale",
-    )
-    parser.add_argument(
-        "--init-momentum",
-        type=float,
-        default=0.5,
-        help="initial inner momentum hyperparameter",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=0, help="random seed for all PRNG splits"
+        "--loss-interval",
+        type=int,
+        default=LOSS_INTERVAL,
+        help=f"compute validation loss every N steps (default: {LOSS_INTERVAL})",
     )
     return parser
-
-
-def build_outer_optimizer(name: str, lr: float) -> optax.GradientTransformation:
-    if name == "sgd":
-        return optax.sgd(lr)
-    if name == "adam":
-        return optax.adam(lr)
-    raise ValueError(f"Unsupported outer optimizer '{name}'.")
 
 
 class Problem(eqx.Module):
@@ -295,7 +309,10 @@ class Problem(eqx.Module):
         raise NotImplementedError
 
     def grad(
-        self, windowing: int = -1, expanded: bool = False, filter=eqx.is_inexact_array
+        self,
+        windowing: int = -1,
+        expanded: bool = False,
+        filter=eqx.is_inexact_array,
     ):
         def fn(params: eqx.Module, init_args: Any = None):
             # standard use for init_args: store the random key there
@@ -311,7 +328,7 @@ class Problem(eqx.Module):
                 stepwise_aux, step_idx = xs_i
                 if windowing != -1:
                     state = jax.lax.cond(
-                        jnp.mod(step_idx, windowing) == windowing - 1,
+                        jnp.mod(step_idx, windowing) == 0,
                         lambda: jax.lax.stop_gradient(state),
                         lambda: state,
                     )
@@ -363,7 +380,7 @@ class Problem(eqx.Module):
                 # This prevents gradients from flowing to earlier timesteps at window boundaries
                 if windowing != -1:
                     grad_for_state = jax.lax.cond(
-                        jnp.mod(step_idx, windowing) == windowing - 1,
+                        jnp.mod(step_idx, windowing) == 0,
                         lambda gs: jax.tree.map(jnp.zeros_like, gs),
                         lambda gs: gs,
                         grad_for_state,
@@ -376,10 +393,15 @@ class Problem(eqx.Module):
                 lambda t: jnp.zeros_like(t),
                 eqx.filter(
                     init_state, eqx.is_inexact_array
-                ),  # that's what's returned by eqx.filter_grad
+                ),  # that's what's returned by eqx.filter_grad - inexact arrays
             )
             _, stepwise_grads_pytree = jax.lax.scan(
                 backward_body, grad_init, (past_states, *xs), reverse=True
+            )
+
+            # invert such that the first value in the vector is 1-long gradient, k-th is k-long gradient
+            stepwise_grads_pytree = jax.tree.map(
+                lambda x: x[::-1], stepwise_grads_pytree
             )
 
             return total_loss, stepwise_grads_pytree
@@ -407,6 +429,7 @@ class GradientBasedHPO(Problem):
     data_key: jax.Array
     max_steps: int = eqx.field(static=True)
     batch_size: int = eqx.field(static=True)
+    loss_interval: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -416,6 +439,7 @@ class GradientBasedHPO(Problem):
         num_steps: int,
         batch_size: int,
         key: jax.Array,
+        loss_interval: int = LOSS_INTERVAL,
     ):
         params, static = eqx.partition(model, eqx.is_inexact_array)
         self.initial_params = params
@@ -425,7 +449,7 @@ class GradientBasedHPO(Problem):
         self.val_inputs, self.val_targets = val_data
         self.max_steps = num_steps
         self.batch_size = batch_size
-        self.data_key = key
+        self.loss_interval = loss_interval
 
     def _train_loss(self, params, reg_scale, batch_inputs, batch_targets):
         model = eqx.combine(params, self.model_static)
@@ -450,10 +474,15 @@ class GradientBasedHPO(Problem):
         )
 
     def single_step_loss(self, state: TrainState, step_idx=None, step_aux=None):
-        model = eqx.combine(state.params, self.model_static)
-        preds = eqx.filter_vmap(model)(self.val_inputs[:100])
-        loss = jnp.mean((preds - self.val_targets[:100]) ** 2)
-        return jax.lax.cond(step_idx == self.max_steps - 1, lambda: loss, lambda: 0.0)
+        def fn():
+            model = eqx.combine(state.params, self.model_static)
+            preds = eqx.filter_vmap(model)(self.val_inputs)
+            loss = jnp.mean((preds - self.val_targets) ** 2)
+            return loss
+
+        return jax.lax.cond(
+            step_idx % self.loss_interval == self.loss_interval - 1, fn, lambda: 0.0
+        )
 
     def stepwise_data(self):
         k1, _ = jr.split(self.data_key)
@@ -481,28 +510,6 @@ class GradientBasedHPO(Problem):
         new_step = state.step + 1
 
         return TrainState(params=new_params, momentum=new_momentum, step=new_step), None
-
-
-class Optimizer:
-    # the interface which kinda isolates the whole optimization logic:
-    # since the proposed method requires intimate access to the internals of the problem
-    # we are not satisfied with e.g. optax stuff
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError
-
-    def update(self, problem, problem_params):
-        raise NotImplementedError
-
-
-class SGD(Optimizer):
-    learning_rate: jax.Array
-
-    def __init__(self, learning_rate: float | jax.Array):
-        self.learning_rate = jnp.asarray(learning_rate, dtype=jnp.float32)
-
-    def update(self, problem: Problem, problem_params):
-        grads = jax.grad(problem.objective)(problem_params)
-        return jax.tree.map(lambda g: -self.learning_rate * g, grads)
 
 
 if __name__ == "__main__":
