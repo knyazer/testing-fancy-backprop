@@ -9,8 +9,6 @@ import jax
 import jax.numpy as jnp
 import jax.random as jr
 
-from bptt import get_bptt_gradients_fast
-
 
 class SimpleCNN(eqx.Module):
     conv1: nn.Conv2d
@@ -79,39 +77,6 @@ def preprocess_images(images: jax.Array) -> jax.Array:
     return images / scale
 
 
-def evaluate_dataset(
-    model: SimpleCNN,
-    eval_data: tuple[jax.Array],
-    *,
-    eval_batch_size: int = 128,
-) -> Tuple[jax.Array, jax.Array]:
-    inputs, targets = eval_data
-
-    def single_loss_fn(input, target):
-        return jnp.sum((model(input) - target) ** 2)
-
-    n = (inputs.shape[0] // eval_batch_size) * eval_batch_size
-
-    batched_inputs = inputs[:n].reshape(
-        inputs.shape[0] // eval_batch_size, eval_batch_size, *inputs.shape[1:]
-    )
-    batched_targets = targets[:n].reshape(
-        targets.shape[0] // eval_batch_size, eval_batch_size, *targets.shape[1:]
-    )
-
-    def batch_body(carry, batch_inputs):
-        inputs, targets = batch_inputs
-        loss_acc = eqx.filter_vmap(single_loss_fn)(inputs, targets).mean()
-        return carry + loss_acc, None
-
-    total_loss, _ = jax.lax.scan(
-        batch_body,
-        0.0,
-        (batched_inputs, batched_targets),
-    )
-    return total_loss / len(batched_inputs)
-
-
 def decode_hyperparams(raw_values: jax.Array) -> Tuple[jax.Array, jax.Array, jax.Array]:
     raw_values = jnp.asarray(raw_values, dtype=jnp.float32).reshape(-1)
     raw_values = jnp.nan_to_num(raw_values, nan=0.0, posinf=20.0, neginf=-20.0)
@@ -149,67 +114,6 @@ def encode_hyperparams(
     return jnp.array(out, dtype=jnp.float32)
 
 
-def train_model(
-    raw_hparams: jax.Array,
-    init_model: SimpleCNN,
-    train_data: tuple[jax.Array],
-    batch_size: int,
-    num_steps: int,
-    key: jax.Array,
-):
-    train_inputs, train_targets = train_data
-    lr, momentum, reg = decode_hyperparams(raw_hparams)
-    model_dyn, model_st = eqx.partition(init_model, eqx.is_inexact_array)
-    optimizer = opts.sgd(lr, momentum=momentum)
-    opt_state = optimizer.init(model_dyn)
-
-    def loss_fn(params, inputs, targets):
-        model = eqx.combine(params, model_st)
-        return eqx.filter_vmap(lambda x, y: (model(x) - y) ** 2)(inputs, targets).sum()
-
-    def body(carry, key):
-        params, opt_state = carry
-
-        idx = jr.choice(key, train_inputs.shape[0], (batch_size,), replace=False)
-        grads = eqx.filter_grad(
-            lambda p: loss_fn(p, train_inputs[idx], train_targets[idx]),
-        )(params)
-
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return (params, opt_state), None
-
-    (model_dyn, _), _ = jax.lax.scan(
-        jax.checkpoint(body), (model_dyn, opt_state), jr.split(key, num_steps)
-    )
-    return eqx.combine(model_dyn, model_st)
-
-
-def objective_fn(
-    raw_hparams: jax.Array,
-    init_model: SimpleCNN,
-    train_data: tuple[jax.Array],
-    val_data: tuple[jax.Array],
-    inner_batch_size: int,
-    outer_batch_size: int,
-    num_steps: int,
-    key: jax.Array,
-):
-    def single_objective(key):
-        trained_model = train_model(
-            raw_hparams=raw_hparams,
-            init_model=init_model,
-            train_data=train_data,
-            batch_size=inner_batch_size,
-            num_steps=num_steps,
-            key=key,
-        )
-
-        return evaluate_dataset(trained_model, val_data)
-
-    return eqx.filter_vmap(single_objective)(jr.split(key, outer_batch_size)).mean()
-
-
 def run_hpo(args):
     key = jr.PRNGKey(args.seed)
 
@@ -236,26 +140,21 @@ def run_hpo(args):
         val_data=(val_images, val_targets),
         num_steps=args.inner_steps,
         batch_size=args.inner_batch,
+        key=jr.key(0),
     )
 
     outer_params = encode_hyperparams(args.init_lr, args.init_momentum, args.init_reg)
     outer_optimizer = SGD(args.outer_lr)
 
-    outer_objective = eqx.filter_jit(problem.objective)
-
     for step in range(args.outer_steps):
-        val_loss = outer_objective(outer_params)
-        updates = outer_optimizer.update(problem, outer_params)
-        outer_params = jax.tree.map(lambda p, u: p + u, outer_params, updates)
+        v1, g1 = problem.grad()(outer_params)
+        v3, g3 = problem.grad(windowing=10)(outer_params)
+        v4, g4 = problem.grad(windowing=10, expanded=True)(outer_params)
+        print(g4.sum(axis=0), "expanded")
+        print("should be equal to ", g3)
+        print("should _not_ be equal to", g1)
+        breakpoint()
 
-        lr, momentum, reg = decode_hyperparams(outer_params)
-        print(
-            f"[outer step {step}] "
-            f"val_loss={float(val_loss):.6f} "
-            f"lr={float(lr):.5f} reg={float(reg):.6f} momentum={float(momentum):.3f}"
-        )
-
-    final_loss = outer_objective(outer_params)
     decoded_params = decode_hyperparams(outer_params)
     print(
         "\nFinal hyperparameters: "
@@ -263,7 +162,6 @@ def run_hpo(args):
         f"reg={float(decoded_params[2]):.6f}, "
         f"momentum={float(decoded_params[1]):.3f}"
     )
-    print(f"Validation metrics: loss={float(final_loss):.6f}")
 
 
 def build_parser():
@@ -352,140 +250,144 @@ def build_outer_optimizer(name: str, lr: float) -> optax.GradientTransformation:
 
 
 class Problem(eqx.Module):
-    max_steps: int = 1000  # the maximum number of steps is forced
+    max_steps: int = 1000  # the maximum number of steps
 
     def __init__(self, *args, **kwargs):
-        # store static hypers
+        # store constant hypers
         raise NotImplementedError
 
     # defines common methods to interact with the thing in question
-    def step(self, state, problem_params):
-        # returns (new_state, step_loss)
-        # - step_loss is the per-step contribution collected by the scan
+    def step(self, state, params, stepwise_aux):
+        # returns new_state, step_aux - with aux being some random data
         raise NotImplementedError
 
-    def loss(self, step_losses, state):
-        # given per-step losses (scan outputs) and final state, what's the scalar loss?
-        raise NotImplementedError
-
-    def objective(self, problem_params):
-        raise NotImplementedError
-
-    def initial_state(self):
-        # generates the initial state based off whatever you want
-        raise NotImplementedError
-
-
-class Optimizer:
-    # the interface which kinda isolates the whole optimization logic:
-    # since the proposed method requires intimate access to the internals of the problem
-    # we are not satisfied with e.g. optax stuff
-    def __init__(self, *args, **kwargs):
-        raise NotImplementedError
-
-    def update(self, problem, problem_params):
-        # returns the update for the parameters
-        # e.g. something like:
-        # def to_grad(problem_params):
-        #   state = problem.initial_state()
-        #   for i in range(problem.max_steps):
-        #     state, _ = problem.step(state, problem_params)
-        #   return problem.loss(state)
-        # return -learning_rate * jax.grad(to_grad)(problem_params)
-        raise NotImplementedError
-
-    def objective(self, problem_params):
-        num_batches = self.train_inputs.shape[0] // self.batch_size
-        batched_inputs = self.train_inputs[: num_batches * self.batch_size].reshape(
-            num_batches, self.batch_size, *self.train_inputs.shape[1:]
-        )
-        batched_targets = self.train_targets[: num_batches * self.batch_size].reshape(
-            num_batches, self.batch_size, *self.train_targets.shape[1:]
-        )
-
-        init_state = self.initial_state()
-
-        def body(state, batch):
-            batch_inputs, batch_targets = batch
-            return self.step(state, problem_params, batch_inputs, batch_targets), None
-
-        final_state, step_losses = jax.lax.scan(
-            jax.checkpoint(body), init_state, (batched_inputs, batched_targets)
-        )
-        return self.loss(step_losses, final_state)
-
-
-def problem_grad(
-    problem, windowing: int = -1, expanded: bool = False, filter=eqx.is_inexact_array
-):
-    def fn(params: eqx.Module, init_args: Any):
-        params_dyn, params_st = eqx.partition(params, filter)
-        init_state = problem.init_state(*init_args)
+    def loss(self, params, init_args=None):
+        # convenience wrapper to get the loss directly
+        if init_args is None:
+            init_state = self.init_state()
+        else:
+            init_state = self.init_state(*init_args)
 
         def body(state, xs_i):
             stepwise_aux, step_idx = xs_i
-            if windowing != -1:
-                state = jax.lax.cond(
-                    jnp.mod(step_idx, windowing) == windowing - 1,
-                    lambda: jax.lax.stop_gradient(state),
-                    lambda: state,
-                )
-            new_state, aux = problem.step(state, params, stepwise_aux)
-            loss = problem.single_step_loss(new_state, step_idx=step_idx)
+            new_state, step_aux = self.step(state, params, stepwise_aux)
+            loss = self.single_step_loss(new_state, step_idx=step_idx)
             return new_state, (state, aux, loss)
 
-        xs = (problem.stepwise_data(), jnp.arange(problem.max_steps))
+        xs = (self.stepwise_data(), jnp.arange(self.max_steps))
         last_state, (past_states, aux, losses) = jax.lax.scan(body, init_state, xs)
 
         total_loss = jnp.sum(losses)
 
-        # if we are not expanded -> we do filter_and_grad wrap over loss value
-        if not expanded:
-            return total_loss
+        return total_loss
 
-        # if we are expanded -> use hand-crafted backprop
-        def backward_body(grad_carry, scan_inputs):
-            state, stepwise_aux, step_idx = scan_inputs
-            new_state, step_aux = problem.step(state, params, stepwise_aux)
+    def initial_state(self, args=None):
+        # generates the initial state based off whatever you want
+        raise NotImplementedError
 
-            grad_from_loss = problem.single_loss(new_state, step_idx=step_idx)
-            grad_total = jax.tree.map(
-                lambda g1, g2: g1 + g2, grad_carry, grad_from_loss
+    def single_step_loss(self, state, step_idx=None, step_aux=None):
+        raise NotImplementedError
+
+    def stepwise_data(self):
+        # generates input data for the forward/backward pass, per-step
+        # this could be e.g. batches for meta-optimization, character at i^th index
+        # for training sentence copying, etc
+        raise NotImplementedError
+
+    def grad(
+        self, windowing: int = -1, expanded: bool = False, filter=eqx.is_inexact_array
+    ):
+        def fn(params: eqx.Module, init_args: Any = None):
+            # standard use for init_args: store the random key there
+            params_dyn, params_st = eqx.partition(params, filter)
+            if init_args is None:
+                init_state = self.initial_state()
+            else:
+                init_state = self.initial_state(*init_args)
+            state_dyn, state_st = eqx.partition(init_state, eqx.is_array_like)
+
+            # the loop for scan: a single node in the dependency graph
+            def body(state, xs_i):
+                stepwise_aux, step_idx = xs_i
+                if windowing != -1:
+                    state = jax.lax.cond(
+                        jnp.mod(step_idx, windowing) == windowing - 1,
+                        lambda: jax.lax.stop_gradient(state),
+                        lambda: state,
+                    )
+                new_state, step_aux = self.step(
+                    eqx.combine(state, state_st), params, stepwise_aux
+                )
+                loss = self.single_step_loss(new_state, step_idx=step_idx)
+                return eqx.filter(new_state, eqx.is_array_like), (state, step_aux, loss)
+
+            xs = (self.stepwise_data(), jnp.arange(self.max_steps))
+            body = body if expanded else jax.checkpoint(body)
+            last_state, (past_states, aux, losses) = jax.lax.scan(body, init_state, xs)
+
+            # the final loss is the sum of reported losses
+            total_loss = jnp.sum(losses)
+
+            # if we are not expanded -> we do filter_and_grad wrap over loss value
+            if not expanded:
+                return total_loss
+
+            # if we are expanded -> use hand-crafted backprop
+            def backward_body(grad_carry, scan_inputs):
+                state, stepwise_aux, step_idx = scan_inputs
+
+                new_state, step_aux = self.step(
+                    eqx.combine(state, state_st),
+                    eqx.combine(params_dyn, params_st),
+                    stepwise_aux,
+                )
+
+                grad_from_loss = eqx.filter_grad(
+                    lambda s: self.single_step_loss(s, step_idx=step_idx)
+                )(new_state)
+                grad_total = jax.tree.map(
+                    lambda g1, g2: g1 + g2, grad_carry, grad_from_loss
+                )
+                vjp_fn = eqx.filter_vjp(
+                    lambda p, s: self.step(
+                        eqx.combine(s, state_st),
+                        eqx.combine(p, params_st),
+                        stepwise_aux,
+                    )[0],
+                    params_dyn,
+                    state,
+                )[1]
+                grad_for_params, grad_for_state = vjp_fn(grad_total)
+
+                # Apply windowing: zero out grad_for_state AFTER vjp to truncate gradient flow
+                # This prevents gradients from flowing to earlier timesteps at window boundaries
+                if windowing != -1:
+                    grad_for_state = jax.lax.cond(
+                        jnp.mod(step_idx, windowing) == windowing - 1,
+                        lambda gs: jax.tree.map(jnp.zeros_like, gs),
+                        lambda gs: gs,
+                        grad_for_state,
+                    )
+
+                return grad_for_state, grad_for_params
+
+            # initialize the grad with zeroes -> \frac{d_L}{d_s} = 0 (gradient w.r.t. state)
+            grad_init = jax.tree.map(
+                lambda t: jnp.zeros_like(t),
+                eqx.filter(
+                    init_state, eqx.is_inexact_array
+                ),  # that's what's returned by eqx.filter_grad
             )
-            vjp_fn = eqx.filter_vjp(  # ??
-                lambda s, p: problem.single_step_loss(
-                    problem.step(s, eqx.combine(p, params_st), stepwise_aux)[0],
-                    step_idx=step_idx,
-                ),
-                state,
-                params_dyn,
-            )[1]
-            grad_for_params, grad_for_state = vjp_fn(grad_total)
+            _, stepwise_grads_pytree = jax.lax.scan(
+                backward_body, grad_init, (past_states, *xs), reverse=True
+            )
 
-            return grad_for_state, grad_for_params
+            return total_loss, stepwise_grads_pytree
 
-        grad_init = jnp.tree.map(lambda t: jnp.zeros_like(t), params_dyn)
-        _, stepwise_grads_pytree = jax.lax.scan(
-            backward_body, grad_init, (past_states, *xs), reverse=True
-        )
-
-        return total_loss, stepwise_grads_pytree
-
-    if not expanded:
-        return eqx.filter_jit(fn)
-    else:
-        return eqx.filter_value_and_grad(fn)
-
-
-class SGD(Optimizer):
-    learning_rate: jax.Array
-
-    def __init__(self, learning_rate: float | jax.Array):
-        self.learning_rate = jnp.asarray(learning_rate, dtype=jnp.float32)
-
-    def update(self, problem: Problem, problem_params):
-        grads = jax.grad(problem.objective)(problem_params)
-        return jax.tree.map(lambda g: -self.learning_rate * g, grads)
+        if expanded:
+            return eqx.filter_jit(fn)
+        else:
+            return eqx.filter_value_and_grad(fn)
 
 
 class TrainState(eqx.Module):
@@ -502,6 +404,7 @@ class GradientBasedHPO(Problem):
     model_static: Any = eqx.field(static=True)
     initial_params: Any
     initial_momentum: Any
+    data_key: jax.Array
     max_steps: int = eqx.field(static=True)
     batch_size: int = eqx.field(static=True)
 
@@ -512,6 +415,7 @@ class GradientBasedHPO(Problem):
         val_data: tuple[jax.Array, jax.Array],
         num_steps: int,
         batch_size: int,
+        key: jax.Array,
     ):
         params, static = eqx.partition(model, eqx.is_inexact_array)
         self.initial_params = params
@@ -521,6 +425,7 @@ class GradientBasedHPO(Problem):
         self.val_inputs, self.val_targets = val_data
         self.max_steps = num_steps
         self.batch_size = batch_size
+        self.data_key = key
 
     def _train_loss(self, params, reg_scale, batch_inputs, batch_targets):
         model = eqx.combine(params, self.model_static)
@@ -537,40 +442,29 @@ class GradientBasedHPO(Problem):
         reg_loss = reg_scale * l2_sum(params)
         return data_loss + reg_loss
 
-    def _val_loss(self, params):
-        model = eqx.combine(params, self.model_static)
-        preds = eqx.filter_vmap(model)(self.val_inputs)
-        return jnp.mean(jnp.sum((preds - self.val_targets) ** 2, axis=-1))
-
-    def initial_state(self):
+    def initial_state(self, *_):
         return TrainState(
             params=self.initial_params,
             momentum=self.initial_momentum,
             step=jnp.array(0, dtype=jnp.int32),
         )
 
-    def objective(self, problem_params):
-        num_batches = self.train_inputs.shape[0] // self.batch_size
-        batched_inputs = self.train_inputs[: num_batches * self.batch_size].reshape(
-            num_batches, self.batch_size, *self.train_inputs.shape[1:]
+    def single_step_loss(self, state: TrainState, step_idx=None, step_aux=None):
+        model = eqx.combine(state.params, self.model_static)
+        preds = eqx.filter_vmap(model)(self.val_inputs[:100])
+        loss = jnp.mean((preds - self.val_targets[:100]) ** 2)
+        return jax.lax.cond(step_idx == self.max_steps - 1, lambda: loss, lambda: 0.0)
+
+    def stepwise_data(self):
+        k1, _ = jr.split(self.data_key)
+        indices = jr.randint(
+            k1, (self.max_steps, self.batch_size), 0, len(self.train_inputs)
         )
-        batched_targets = self.train_targets[: num_batches * self.batch_size].reshape(
-            num_batches, self.batch_size, *self.train_targets.shape[1:]
-        )
+        return self.train_inputs[indices], self.train_targets[indices]
 
-        init_state = self.initial_state()
-
-        def body(state, batch):
-            batch_inputs, batch_targets = batch
-            return self.step(state, problem_params, batch_inputs, batch_targets), None
-
-        final_state, step_losses = jax.lax.scan(
-            jax.checkpoint(body), init_state, (batched_inputs, batched_targets)
-        )
-        return self.loss(step_losses, final_state)
-
-    def step(self, state, problem_params, batch_inputs, batch_targets):
-        lr, momentum, reg = decode_hyperparams(problem_params)
+    def step(self, state, params, stepwise_aux):
+        batch_inputs, batch_targets = stepwise_aux
+        lr, momentum, reg = decode_hyperparams(params)
 
         step_loss, grads = eqx.filter_value_and_grad(
             lambda p: self._train_loss(p, reg, batch_inputs, batch_targets),
@@ -586,10 +480,29 @@ class GradientBasedHPO(Problem):
         )
         new_step = state.step + 1
 
-        return TrainState(params=new_params, momentum=new_momentum, step=new_step)
+        return TrainState(params=new_params, momentum=new_momentum, step=new_step), None
 
-    def loss(self, step_losses: jax.Array, state: TrainState):
-        return self._val_loss(state.params)
+
+class Optimizer:
+    # the interface which kinda isolates the whole optimization logic:
+    # since the proposed method requires intimate access to the internals of the problem
+    # we are not satisfied with e.g. optax stuff
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def update(self, problem, problem_params):
+        raise NotImplementedError
+
+
+class SGD(Optimizer):
+    learning_rate: jax.Array
+
+    def __init__(self, learning_rate: float | jax.Array):
+        self.learning_rate = jnp.asarray(learning_rate, dtype=jnp.float32)
+
+    def update(self, problem: Problem, problem_params):
+        grads = jax.grad(problem.objective)(problem_params)
+        return jax.tree.map(lambda g: -self.learning_rate * g, grads)
 
 
 if __name__ == "__main__":
