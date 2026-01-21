@@ -5,3 +5,6 @@ optax
 tensorflow
 tensorflow-datasets
 tqdm
+seaborn
+numpy
+pandas
