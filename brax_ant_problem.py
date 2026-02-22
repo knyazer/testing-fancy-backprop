@@ -1,14 +1,4 @@
-"""Brax Ant environment as a Problem for gradient-based optimization.
-
-The simulation chain is: a policy network applied at each physics step,
-creating a long dependency chain through the differentiable simulator.
-The outer parameters are the policy network weights, optimized to maximize
-episode reward.
-
-Requires: pip install brax
-"""
-
-from typing import Any
+from typing import Any, Self
 
 import equinox as eqx
 import equinox.nn as nn
@@ -23,8 +13,6 @@ from gradient_based_hpo import Problem, SEED
 
 
 class PolicyMLP(eqx.Module):
-    """Simple MLP policy mapping observations to actions."""
-
     linear1: nn.Linear
     linear2: nn.Linear
     linear3: nn.Linear
@@ -44,7 +32,7 @@ class PolicyMLP(eqx.Module):
 
     def __call__(self, obs: jax.Array) -> jax.Array:
         x = jax.nn.relu(self.linear1(obs))
-        x = jax.nn.relu(self.linear2(x))
+        x = jax.nn.relu(self.linear2(x)) + x
         return jax.nn.tanh(self.linear3(x))
 
 
@@ -107,8 +95,7 @@ class BraxAntProblem(Problem):
         params, _ = eqx.partition(policy, eqx.is_inexact_array)
         return params
 
-    def new(self, key: jax.Array | None = None) -> "BraxAntProblem":
-        """Create a new problem instance with a different data key."""
+    def new(self, key: jax.Array | None = None) -> Self:
         if key is None:
             key, _ = jr.split(self.data_key)
         return eqx.tree_at(lambda p: p.data_key, self, key)
@@ -140,7 +127,6 @@ class BraxAntProblem(Problem):
         )
 
     def stepwise_data(self):
-        """No external per-step data needed; return dummy array for scan."""
         return jnp.zeros((self.max_steps,))
 
 

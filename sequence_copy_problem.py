@@ -44,9 +44,7 @@ class RNNCopyCell(eqx.Module):
         self.hidden_to_hidden = nn.Linear(hidden_size, hidden_size, key=k2)
         self.hidden_to_output = nn.Linear(hidden_size, output_size, key=k3)
 
-    def __call__(
-        self, hidden: jax.Array, x: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
+    def __call__(self, hidden: jax.Array, x: jax.Array) -> tuple[jax.Array, jax.Array]:
         new_hidden = jax.nn.tanh(
             self.input_to_hidden(x) + self.hidden_to_hidden(hidden)
         )
@@ -55,29 +53,12 @@ class RNNCopyCell(eqx.Module):
 
 
 class RNNCopyState(eqx.Module):
-    """State for the RNN sequence copy task."""
-
     hidden: jax.Array  # (hidden_size,)
     output: jax.Array  # (vocab_size,) logits from last step
     step: jax.Array
 
 
 class SequenceCopyProblem(Problem):
-    """Sequence copying task for RNN optimization.
-
-    Given a sequence of tokens, the RNN must encode it into its hidden state
-    during the first half of steps (encoding phase), then reproduce it during
-    the second half (decoding phase). No teacher forcing is used during
-    decoding: the RNN feeds its own softmax predictions as input.
-
-    Total steps = 2 * seq_length.
-      Encoding: steps 0 .. seq_length-1  (read ground truth, no loss)
-      Decoding: steps seq_length .. 2*seq_length-1  (produce output, compute loss)
-
-    Outer parameters: RNN cell weights (pytree)
-    Loss: cross-entropy on predicted sequence during decoding
-    """
-
     rnn_static: Any = eqx.field(static=True)
     initial_rnn_params: Any
     target_sequence: jax.Array  # (seq_length,) integer tokens
@@ -119,9 +100,7 @@ class SequenceCopyProblem(Problem):
 
     def sample_init_params(self, key: jax.Array):
         """Generate randomly initialized RNN weights."""
-        rnn = RNNCopyCell(
-            self.vocab_size, self.hidden_size, self.vocab_size, key=key
-        )
+        rnn = RNNCopyCell(self.vocab_size, self.hidden_size, self.vocab_size, key=key)
         params, _ = eqx.partition(rnn, eqx.is_inexact_array)
         return params
 
@@ -147,7 +126,9 @@ class SequenceCopyProblem(Problem):
 
     def step(self, state: RNNCopyState, params, stepwise_aux):
         """One RNN step: encoding reads ground truth, decoding uses own output."""
-        provided_input = stepwise_aux  # (vocab_size,) one-hot during encoding, zeros during decoding
+        provided_input = (
+            stepwise_aux  # (vocab_size,) one-hot during encoding, zeros during decoding
+        )
 
         # During encoding (step < seq_length): use the ground truth token
         # During decoding (step >= seq_length): use own prediction (no teacher forcing)
@@ -195,9 +176,7 @@ if __name__ == "__main__":
     key = jr.PRNGKey(SEED)
 
     print("Initializing sequence copy problem...")
-    problem = SequenceCopyProblem(
-        seq_length=10, vocab_size=8, hidden_size=32, key=key
-    )
+    problem = SequenceCopyProblem(seq_length=100, vocab_size=8, hidden_size=32, key=key)
     params = problem.initial_rnn_params
 
     print(f"Seq length: {problem.seq_length}, Vocab: {problem.vocab_size}")
@@ -209,13 +188,11 @@ if __name__ == "__main__":
 
     print("Computing initial gradient...")
     loss, grads = jit_grad_fn(params)
-    grad_norm = jnp.sqrt(
-        sum(float(jnp.sum(g**2)) for g in jax.tree.leaves(grads))
-    )
+    grad_norm = jnp.sqrt(sum(float(jnp.sum(g**2)) for g in jax.tree.leaves(grads)))
     print(f"Loss: {float(loss):.4f}, Grad norm: {float(grad_norm):.4e}")
 
     # Simple training loop: overfit to one sequence
-    optimizer = optax.adam(1e-3)
+    optimizer = optax.adam(1e-2)
     opt_state = optimizer.init(params)
 
     print("\nTraining RNN to copy a fixed sequence...")
@@ -245,7 +222,5 @@ if __name__ == "__main__":
 
     print(f"\nTarget:     {problem.target_sequence.tolist()}")
     print(f"Predicted:  {predictions}")
-    correct = sum(
-        p == int(t) for p, t in zip(predictions, problem.target_sequence)
-    )
+    correct = sum(p == int(t) for p, t in zip(predictions, problem.target_sequence))
     print(f"Accuracy:   {correct}/{problem.seq_length}")
