@@ -12,6 +12,8 @@ dependencies = [
     "mujoco>=3.5.0",
     "optax>=0.2.7",
     "seaborn>=0.13.2",
+    "tensorflow>=2.20.0",
+    "tensorflow-datasets>=4.9.9",
     "tqdm>=4.67.3",
     "warp>=1.0.4",
 ]

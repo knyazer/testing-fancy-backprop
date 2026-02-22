@@ -9,7 +9,7 @@ import optax
 
 from brax import envs as brax_envs
 
-from gradient_based_hpo import Problem, SEED
+from problem import Problem
 
 
 class PolicyMLP(eqx.Module):
@@ -131,7 +131,7 @@ class BraxAntProblem(Problem):
 
 
 if __name__ == "__main__":
-    key = jr.PRNGKey(SEED)
+    key = jr.PRNGKey(0)
 
     print("Initializing Brax Ant problem...")
     problem = BraxAntProblem(key=key)

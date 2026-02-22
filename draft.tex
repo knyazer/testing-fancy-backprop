@@ -1,0 +1,182 @@
+\documentclass{article}
+\usepackage{amsmath, amssymb, amsthm, amsfonts}
+\usepackage{natbib}
+\usepackage[a4paper,margin=1in]{geometry}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{remark}{Remark}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\norm}[1]{\left\lVert#1\right\rVert}
+\newcommand{\grad}{\nabla}
+
+\begin{document}
+
+
+\section{Abstract}
+
+% topic
+Optimizing recurrently applied black-box systems (e.g. RNNs) via backpropagation has long been a standing problem in machine learning. 
+% motvation
+For many applications, attempting to use gradient descent algorithms directly leads to exploding gradients: while the expected norm of gradients remains well-behaved, the variance increases exponentially with the length of the backpropagation chain, thus rendering most methods useless.
+% contriubtion
+We propose a method to mitigate this issue by using a per-step split-up optimization procedure, that remains unbiased while allowing for practical optimization.
+% detail/nuance
+Specifically, we adapt the framework of first-order oracle algorithms to our setting, and show that our method converges to the global optima under standard assumptions. The price one has to pay for this is storing multiple copies of the momentum.
+% evidence
+The performance of our method significantly exceeds the performance of previously existing alternatives, sometimes by an order of magnitude.
+% weaker result
+We also rediscover a simplified, biased version of our method that does not require higher memory consumption, and does not introduce any memory overhead. The method leads to almost no loss in performance with respect to the unbiased method, in all of the evaluated tasks.
+% narrow impact
+Our method is, to our knowledge, the first method for unbiased training of systems prone to gradient explosion.
+% wider impact
+We hope that our proposed method would enable better training in various recurrent systems.
+
+
+\section{Experiments}
+
+The two main experiments we consider are gradient-based meta optimization and reinforcement learning with differentiable simulators.
+
+Note that we use truncation in a lot of the cases. Importantly, while truncation is, in fact, biased, it is usually biased sufficiently little and improves the variance enough that it is a very useful thing to do.
+
+\subsection{Meta Optimization}
+
+We setup an experiment largely similar to the one in 3.2 of \citet{gradients_are_not_all_you_need}. We have a 2-layer MLP with ReLU activations trained using (differentiable variant of) SGD on MNIST dataset. The aim is to find the optimal learning rate. We do this by simply differentiating through the whole optimization process: e.g. if one can train such an MLP in 500 steps, we do these 500 steps, and the backpropagate through them (with gradient checkpointing to reduce the memory consumption) to obtain the gradient of the final validation with respect to the learning rate.
+
+Figure 2 a) verifies that the gradient variance does, in fact, increase after increasing the length of the chain subexponentially up to a point (about 160 steps), after which the variance either explodes - becoming infinite, or continues the subexponential trend. We attribute this to the switch between the "going towards the optima" learning, and "oscilatting around the optima". Oscillations near the optima could, seemingly, produce arbitrarily large gradient variance.
+
+Figure 2 b) shows the gradient variance when using gradient clipping. We would expect that after "gradient explosion" the gradient directions become essentially random, which can be seen from the graph: the variance approaches the limiting value (maximum variance achievable under this particular clipping). Thus gradient clipping leads to simply non-informative gradients.
+
+Let's see how the optimization proceeds. We start by setting up the simple untruncated backpropagation with an sgd optimizer, with an adam optimizer, both w/ and w/o gradient clipping. The outer learning rate is tuned by doing a grid-search from 1e-4 to 1e-2 with 10 steps. Looking at the loss training curves, one can see that the loss quickly explodes for larger total number of steps, without reaching a good value of the inner loss (we are optimizing the inner loss, just to remind you).
+
+Now, using windowed backpropagation for 5 different values we are able to get a fairly stable optimization procedure; however, the issue lies in the underwhelming performance: the best performance seems to be achieved on the edge of stability, when the truncation window is as large as possible, before the loss starting to blow up - which is, in this case, around 100 steps.
+
+After all, we switch to our own optimizer - the per-step momentum optimizer - and see how it behaves for different momentum and momentum-decay values. We will also sometimes refer to the momentum-decay values as lyapunov discount values. Our performance is a lot better, and we are more robust to the choice of the hyperparameters. Besides, we can see how even a simplified, biased variant leads to a significantly better performance.
+
+The performance of the method can be further improved by using windowing, which is not necessary, but allows to reduce the memory consumption in exchange for even lower variance estimates and improved performance. The plot with performance/memory tradeoff vs perfomance is shown.
+
+\subsubsection{Adaptive optimizers}
+
+It is quite surprising that most of the modern adaptive optimizers are capable of handling the explosive gradients, unless they are very large: some problems, such as meta-optimization, are prone to have well-behaved optima: if we record how the variance curve looks throughout training, we can see that the variance is exploding only for the initial settings of the hyperparameter (in this case, the starting learning rate is too small), but the closer we get to the optima, the less of the explosive effect is observed. On the other hand for the differentiable simulators, one can see that the effect is the other way around: far from the optima the gradients are somewhat well-behaved - at least the norm is small, while the closer we get to the optima the more unstable it becomes.
+
+We attribute this effect to the stability of the optima: with our meta-learning problem, the optima of the learning rate is very stable, and not even chaotic: as in, if the good learning rate is chosen, the solution will spend most of its time oscillating near optima; on the other hand, solutions for policies in differentiable simulators exhibit a more interesting behaviour of being unstable: high lyapunov constants, since most changes in the action network lead to the model acting exponentially different with the lengths of the chain, with the luapunov constant of around 0.9.
+
+\subsection{Differentiable simulators}
+
+Differentiable simulators are fantastic, and we love them. Blah blah.
+
+
+We repeat the same set of experiments for an Ant task in Brax. We get similar results: our method is superior.
+
+To make sure that both our lyapunov momentum optimizer and per-step lyapunov momentum optimizer are superior, we conduct an HPO run on a few Brax environments. We compare it with the classical approach. As the optimizer we use adam, since it's adaptive nature is better suited for unstable-variance gradient estimates, which are common here. The HPO optimizes for truncation length, learning rate for standard backprop; truncation length, lyapunov factor and learning rate for both per-step and not- optimizers. 
+
+
+% Notice how similar the optimal lyapunov factor is for both per-step and normal optimizers. While we can't come up with a good explanation for it, it is an interesting observation.
+
+\subsection{Training RNN's}
+
+We train recurrent neural nets on a fairly complex task of copy-ing a sequence. We don't do teacher forcing, since this removes the point; the reason to include this example is rather illustrative than practical. 
+
+Give a sequence of characters the aim of an RNN is to reproduce it. Thus the RNN has to encode the character sequence in its latent state, and then reproduce it. These are very long dependencies, with the length of the dependency proportional to the length of the sequence $n$.
+
+\subsubsection{Teacher forcing}
+
+Interestingly, our simplified method is equivavelent to a commonly used heuristic in the RNN world: teacher forcing. Teacher forcing aims to reduce the gradient varinance by setting $\hat{x}_t = f(\hat{x}_{t-1}, s_{t-1})\lambda+(1-\lambda)x_t$ where $x_t$ is the ground truth value of the sequence, $f(x)$ is a single application of an RNN, and $\hat{x}_t$ is prediction value. One can see that when backpropagating through the loss, since the loss wrt ground truth is zero, one arrives it exactly our formulation of the simplified method.
+
+\subsubsection{Origins}
+
+It is hard to pinpoint exactly who was the first one to use this method; I'm sure there are older references, but the first mention we were able to find is the trick B.3 in the \citet{some old protein optimization paper}. We have found a few other references to this "trick": e.g. it was even used in differentiable simulators at some point, \citet{paper by scaramuzza with some robots and using this trick to stabilize gradients}, however the use of this method was never acknowledged, and it seems that most of the community is large unaware of it. One of the auxilary aims of our paper is make sure the general community is aware of this technique.
+
+
+\section{Proof of Convergence for BPTT with Per-Step Adaptive Momentum}
+\subsection{An Adaptation of DeFazio and Gower (2020)}
+
+\subsection{Setup: The BPTT Problem and Adaptive Estimator}
+
+\paragraph{The BPTT Gradient Structure.}
+We consider the optimization of a recurrent model, where the total gradient of the loss \(L\) with respect to the parameters \(\theta\) over a sequence of length \(T\) is decomposed as a sum of per-time-step contributions:
+\[ \grad L(\theta) = \sum_{t=1}^T g_t(\theta) \]
+A well-known challenge in BPTT is that the variance of these contributions is non-uniform. Specifically, gradients corresponding to longer-term dependencies (larger \(t\)) are subject to vanishing or exploding gradient phenomena, resulting in significantly higher variance. We model this formally:
+\[ \text{Var}(g_t(\theta, \xi)) = \E[\norm{g_t(\theta, \xi) - \grad_t L(\theta)}^2] \le \sigma_t^2, \quad \text{where } \sigma_t^2 \text{ increases with } t. \]
+For the purpose of analysis, we can model this as an exponential increase, e.g., \(\sigma_t^2 = \sigma_0^2 \gamma^t\) for some \(\gamma > 1\).
+
+\paragraph{The Per-Step Adaptive Momentum Algorithm.}
+To counteract this non-uniform variance, we apply a separate momentum buffer \(m_t\) to each per-step gradient \(g_t\). At each optimization step \(k\), the updates are:
+\begin{align*}
+    m_t^k &= \beta_t m_t^{k-1} + (1 - \beta_t) g_t(\theta_k, \xi_k), \quad \forall t \in \{1, \dots, T\} \\
+    M_k &= \sum_{t=1}^T m_t^k \quad (\text{Total update direction}) \\
+    \theta_{k+1} &= \theta_k - \eta_k M_k
+\end{align*}
+The key idea is to use an adaptive momentum coefficient \(\beta_t\) that increases with \(t\). This applies stronger smoothing to the higher-variance, long-term gradient contributions, effectively down-weighting their noise.
+
+To prove convergence, we adopt the **iterate averaging reformulation of momentum** from \citet{DeFazio and Gower (2020)}, which is shown in their Theorem 15 to be equivalent to the standard momentum method. Our method fits this framework, where \(M_k\) serves as the gradient estimator.
+
+\subsection{Estimator Variance Analysis}
+
+Before stating the theorem, we derive a tight bound on the variance of our estimator \(M_k\).
+
+\begin{lemma}[Estimator Variance]
+The variance of the adaptive momentum estimator \(M_k\), assuming independence of noise across time steps \(t\), is bounded by:
+\[ \text{Var}(M_k) = \text{Var}\left(\sum_{t=1}^T m_t^k\right) \le \sum_{t=1}^T \frac{1-\beta_t}{1+\beta_t}\sigma_t^2 \]
+\end{lemma}
+\begin{proof}
+The steady-state variance of a single exponential moving average with coefficient \(\beta\) on a signal with variance \(\sigma^2\) is \(\frac{1-\beta}{1+\beta}\sigma^2\). Applying this to each \(m_t^k\) and summing the variances (assuming independence) gives the result. Note, however, that this is only the case if the induced $\beta_{max} \propto \beta_0^{-T}$ is smaller that the $\beta$ used in a standard momentum algorithm.
+\end{proof}
+
+\begin{remark}[Superiority over Standard Momentum]
+A standard momentum optimizer would apply a single coefficient, \(\beta_{\max} = \max_t\{\beta_t\}\), to the total gradient \(\sum_t g_t\). Its variance would be bounded by \(\frac{1-\beta_{\max}}{1+\beta_{\max}} \sum_t \sigma_t^2\). Our adaptive scheme is strictly better because we can choose \(\beta_t\) to be small for low-variance early \(g_t\) terms, leading to a much smaller total sum:
+\[ \sum_{t=1}^T \frac{1-\beta_t}{1+\beta_t}\sigma_t^2 \ll \frac{1-\beta_{\max}}{1+\beta_{\max}} \sum_{t=1}^T \sigma_t^2 \]
+This provable reduction in variance is a direct consequence of the adaptive scheme's more favorable bias profile, as it more accurately tracks the true gradient by trusting reliable short-term signals more than noisy long-term ones.
+\end{remark}
+
+\paragraph{Total Estimator Norm Bound.}
+For the proof, we need a bound on the total expected squared norm of our estimator.
+\[ \E[\norm{M_k}^2] = \norm{\E[M_k]}^2 + \text{Var}(M_k) = \norm{\grad L(\theta_k)}^2 + \text{Var}(M_k) \]
+Let \(G^2_{true} = \sup_\theta \norm{\grad L(\theta)}^2\). We can then define our global bound \(G_M^2\) as:
+\[ G_M^2 := G^2_{true} + \sum_{t=1}^T \frac{1-\beta_t}{1+\beta_t}\sigma_t^2 \]
+We now proceed with the proof, using this tighter, structured bound.
+
+\subsection{Convergence Theorem}
+
+\begin{theorem}
+Let the objective function \(f(\theta)\) be convex and the adaptive estimator \(M_k\) be bounded such that \(\E[\norm{M_k}^2] \le G_M^2\). The projected Adaptive SGD+M method, written in iterate averaging form with factorial power step-sizes \(\eta_k = \eta (k+1)^{\underline{-1/2}}\) and averaging weights \(c_{k+1} = 1/(k + 1)\), satisfies after \(n\) steps:
+\[ \E[f(\theta_n) - f(\theta_*)] \le \sqrt{2}RG_M (n+2)^{\underline{-1/2}} \]
+where \(R\) is the radius of a ball containing the parameter space.
+\end{theorem}
+
+\begin{proof}
+The proof is a minimal adaptation of the proof of Theorem 20 from DeFazio and Gower (2020). The original proof's logic is preserved, as its validity depends only on the bounded norm of the gradient estimator, not its internal structure.
+
+\paragraph{Step 1: The One-Step Inequality.}
+We start from the fundamental one-step inequality (Theorem 17 in the original paper), substituting our estimator \(M_k\) and its bound \(G_M^2\):
+\begin{align}
+    \E[\norm{z_{k+1} - \theta_*}^2] \le \E[\norm{z_k - \theta_*}^2] + \eta_k^2 G_M^2 - 2\frac{\eta_k}{c_k}\E[f(\theta_k) - f(\theta_*)] \nonumber \\
+    + 2\left(\frac{1}{c_k}-1\right)\eta_k \E[f(\theta_{k-1}) - f(\theta_*)] \label{eq:onestep}
+\end{align}
+This step is sound because the derivation of this inequality only requires the estimator to be unbiased in expectation (\(\E[M_k] = \grad L(\theta_k)\)) and have a bounded second moment.
+
+\paragraph{Step 2: Telescoping Sum.}
+Following the paper, we set parameters based on factorial powers to enable an exact telescoping sum:
+\[ \eta_k = \eta (k+1)^{\underline{-1/2}} \quad \text{and} \quad c_k = \frac{1}{k} \]
+The algebraic manipulations to telescope the inequality from \(k=1\) to \(n\) are identical to those in the original proof. This procedure yields the following bound (analogous to their Eq. 40):
+\begin{equation}
+    2(n+1)\eta\E[f(\theta_n) - f(\theta_*)] \le R^2 + \eta^2 G_M^2 \sum_{i=0}^n (i+1)^{\underline{-1/2}} \label{eq:pre_final}
+\end{equation}
+where \(R^2\) bounds the initial distance \(\norm{z_0 - \theta_*}^2\).
+
+\paragraph{Step 3: Applying Factorial Power Properties.}
+We use the exact summation property for factorial powers (Table 1, Eq. 9 of the paper):
+\[ \sum_{i=0}^n (i+1)^{\underline{-1/2}} = 2(n+1)^{\underline{1/2}} \]
+Substituting this into \eqref{eq:pre_final} and dividing by \(2(n+1)\eta\) gives:
+\[ \E[f(\theta_n) - f(\theta_*)] \le \frac{R^2}{2(n+1)\eta} + \eta G_M^2 \frac{(n+1)^{\underline{1/2}}}{n+1} \]
+Using the ratio property of factorial powers, we simplify the last term to \((n+2)^{\underline{-1/2}}\). The bound becomes:
+\[ \E[f(\theta_n) - f(\theta_*)] \le \frac{R^2}{2(n+1)\eta} + \eta G_M^2 (n+2)^{\underline{-1/2}} \]
+
+\paragraph{Step 4: Optimizing the Step-Size Constant.}
+To find the tightest bound, we choose the constant step-size factor \(\eta\) to balance the two terms. The optimal choice, as derived in the original paper, is \(\eta = \frac{R}{G_M\sqrt{2}}\). Substituting this value yields the final result:
+\[ \E[f(\theta_n) - f(\theta_*)] \le \sqrt{2}RG_M (n+2)^{\underline{-1/2}} \]
+This guarantees convergence at a rate of \(O(1/\sqrt{n})\). The constant in the convergence rate depends on \(G_M\), which we have shown to be strictly smaller for our adaptive scheme than for standard momentum, proving the method's theoretical advantage.
+\end{proof}
+
+\end{document}

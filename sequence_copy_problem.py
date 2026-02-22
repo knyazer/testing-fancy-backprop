@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import optax
 
-from gradient_based_hpo import Problem, SEED
+from problem import Problem
 
 
 class RNNCopyCell(eqx.Module):
@@ -173,7 +173,7 @@ class SequenceCopyProblem(Problem):
 
 
 if __name__ == "__main__":
-    key = jr.PRNGKey(SEED)
+    key = jr.PRNGKey(0)
 
     print("Initializing sequence copy problem...")
     problem = SequenceCopyProblem(seq_length=100, vocab_size=8, hidden_size=32, key=key)
