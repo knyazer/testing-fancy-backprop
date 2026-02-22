@@ -20,11 +20,12 @@ NUM_TRAIN = 4_000
 NUM_VAL = 100
 INNER_BATCH = 32
 LOSS_INTERVAL = 1
-INNER_STEPS = 640
+NO_WINDOWING = 1_000_000_000
+INNER_STEPS = 1000
 OUTER_STEPS = 200
 OUTER_BATCH = 4
 OUTER_LR = 0.01
-OUTER_OPTIMIZER = "adam"
+OUTER_OPTIMIZER = "sgd"
 INIT_LR = 0.01
 SEED = 0
 
@@ -198,8 +199,8 @@ def make_train_payload_fn(
     unroll_length: int,
     weight_scale: float,
     loss_interval: int,
-    fixed_batch: bool,
     inner_batch: int,
+    different_init_each_outer_step: bool,
     dummy: bool = False,
 ):
     def build(losses, lrs, grad_norms, final_params):
@@ -217,8 +218,8 @@ def make_train_payload_fn(
             "final_lr": float(decode_hyperparams(final_params)[0]),
             "weight_scale": weight_scale,
             "loss_interval": loss_interval,
-            "fixed_batch": fixed_batch,
             "inner_batch": inner_batch,
+            "different_init_each_outer_step": different_init_each_outer_step,
         }
         if dummy:
             payload["dummy"] = True
@@ -279,15 +280,18 @@ def mean_grad_variance(
     *,
     key: jax.Array,
     init_params,
+    data_key: jax.Array | None = None,
 ) -> jax.Array:
     grad_fn = problem.grad(expanded=False)
-    _, grad0 = grad_fn(base_params, init_args=(init_params,))
+    _, grad0 = grad_fn(base_params, init_args=(init_params,), data_key=data_key)
     grad0 = grad0.reshape(-1)
 
     def body(carry, key_i):
         mean, m2, count = carry
         noise = jr.normal(key_i, base_params.shape) * sigma
-        _, grads = grad_fn(base_params + noise, init_args=(init_params,))
+        _, grads = grad_fn(
+            base_params + noise, init_args=(init_params,), data_key=data_key
+        )
         grads = grads.reshape(-1)
         count = count + 1
         delta = grads - mean
@@ -305,6 +309,49 @@ def mean_grad_variance(
     return jnp.mean(var)
 
 
+def compute_grad_variances(
+    problem: "GradientBasedHPO",
+    base_params: jax.Array,
+    init_params_batched,
+    *,
+    key: jax.Array,
+    sigma: float,
+    num_samples: int,
+    data_key: jax.Array | None = None,
+) -> jax.Array:
+    num_inits = jax.tree_util.tree_leaves(init_params_batched)[0].shape[0]
+    sample_keys = jr.split(key, num_inits)
+    variance_fn = lambda p, k: mean_grad_variance(
+        problem,
+        base_params,
+        sigma,
+        num_samples,
+        key=k,
+        init_params=p,
+        data_key=data_key,
+    )
+    return eqx.filter_vmap(variance_fn)(init_params_batched, sample_keys)
+
+
+def plot_variance_snapshot(
+    variances: jax.Array, *, out_path: str, title: str | None = None
+) -> None:
+    if variances.size == 0:
+        return
+    xs = jnp.arange(variances.shape[0])
+    plt.figure()
+    plt.scatter(xs, variances, color="orange", alpha=0.6)
+    median = jnp.median(variances)
+    plt.axhline(median, color="black", linewidth=2.0)
+    plt.yscale("log")
+    plt.xlabel("init index")
+    plt.ylabel("gradient variance")
+    if title:
+        plt.title(title)
+    plt.savefig(out_path)
+    plt.close()
+
+
 def run_outer_loop(
     problem: "GradientBasedHPO",
     outer_params: jax.Array,
@@ -315,9 +362,11 @@ def run_outer_loop(
     method: str,
     outer_steps: int,
     normalize_window_grads: bool = False,
+    different_init_each_outer_step: bool = False,
     save_filename: str | None = None,
     save_payload_fn: Callable[[list[float], list[float], list[float], jax.Array], dict]
     | None = None,
+    step_callback: Callable[[int, jax.Array], None] | None = None,
     on_exists: str = "error",
     run_label: str = "train",
 ) -> tuple[list[float], list[float], list[float], jax.Array] | None:
@@ -339,8 +388,20 @@ def run_outer_loop(
     jit_grad_fn = eqx.filter_jit(grad_fn)
 
     for step in range(outer_steps):
-        data_key, step_key = jr.split(data_key)
-        val_loss, grads = jit_grad_fn(outer_params, init_args=None, data_key=step_key)
+        if step_callback:
+            step_callback(step, outer_params)
+        if different_init_each_outer_step:
+            data_key, step_key, init_key = jr.split(data_key, 3)
+            init_params = problem.sample_init_params(init_key)
+            init_args = (init_params,)
+        else:
+            data_key, step_key = jr.split(data_key)
+            init_args = None
+        val_loss, grads = jit_grad_fn(
+            outer_params,
+            init_args=init_args,
+            data_key=step_key,
+        )
         if normalize_window_grads and windowing > 0:
             ratio = problem.max_steps / windowing
             if float(ratio).is_integer() and ratio > 0:
@@ -352,6 +413,9 @@ def run_outer_loop(
         updates, opt_state = outer_opt.update(grads, opt_state)
         outer_params = jax.tree.map(lambda p, u: p + u, outer_params, updates)
         outer_params = project_hyperparams(outer_params)
+
+    if step_callback:
+        step_callback(outer_steps, outer_params)
 
     if save_filename and save_payload_fn:
         payload = save_payload_fn(losses, lrs, grad_norms, outer_params)
@@ -373,7 +437,6 @@ def run_variance_experiment(args):
         "variance_samples": args.variance_samples,
         "weight_scale": args.weight_scale,
         "loss_interval": args.loss_interval,
-        "fixed_batch": bool(args.fixed_batch),
     }
     run_id = stable_json_hash(config)
     on_exists = results_on_exists_policy(args)
@@ -415,7 +478,7 @@ def run_variance_experiment(args):
     )
 
     for steps in unroll_lengths:
-        per_unroll_key = data_key if args.fixed_batch else jr.fold_in(data_key, steps)
+        per_unroll_key = data_key
         problem = GradientBasedHPO(
             model=model,
             train_data=(train_images, train_targets),
@@ -423,6 +486,7 @@ def run_variance_experiment(args):
             num_steps=steps,
             batch_size=INNER_BATCH,
             key=per_unroll_key,
+            weight_scale=args.weight_scale,
             loss_interval=args.loss_interval,
         )
         noise_key, sample_key = jr.split(noise_key, 2)
@@ -467,7 +531,6 @@ def run_variance_experiment(args):
         "variance_samples": config["variance_samples"],
         "weight_scale": config["weight_scale"],
         "loss_interval": config["loss_interval"],
-        "fixed_batch": config["fixed_batch"],
     }
     path = save_json(payload, filename, on_exists=results_on_exists_policy(args))
     if path:
@@ -476,6 +539,158 @@ def run_variance_experiment(args):
         print(
             f"Skipped existing variance results at {os.path.join(RESULTS_DIR, filename)}"
         )
+
+
+def run_variance_snapshots_experiment(args):
+    unroll_lengths = parse_int_list(args.train_unroll_lengths)
+    run_config = {
+        "type": "variance_snapshots",
+        "unroll_lengths": unroll_lengths,
+        "outer_steps": OUTER_STEPS,
+        "outer_lr": OUTER_LR,
+        "outer_optimizer": OUTER_OPTIMIZER,
+        "init_lr": INIT_LR,
+        "inner_batch": args.inner_batch,
+        "inner_steps": INNER_STEPS,
+        "weight_scale": args.weight_scale,
+        "loss_interval": args.loss_interval,
+        "variance_sigma": args.variance_sigma,
+        "variance_samples": args.variance_samples,
+        "num_inits": args.num_inits,
+        "different_init_each_outer_step": bool(args.different_init_each_outer_step),
+    }
+    run_id = stable_json_hash(run_config)
+    on_exists = results_on_exists_policy(args)
+    filename = f"variance_snapshots_{run_id}.json"
+    if should_skip_run(run_id, [filename], on_exists=on_exists, run_label="variance"):
+        return
+
+    key = jr.PRNGKey(SEED)
+    data_key, model_key = jr.split(key, 2)
+    train_images, train_labels, val_images, val_labels = load_mnist_arrays(
+        NUM_TRAIN, NUM_VAL
+    )
+
+    num_classes = int(jnp.max(train_labels) - jnp.min(train_labels)) + 1
+    train_images = preprocess_images(train_images)
+    train_targets = jax.nn.one_hot(train_labels, num_classes, dtype=jnp.float32)
+    val_images = preprocess_images(val_images)
+    val_targets = jax.nn.one_hot(val_labels, num_classes, dtype=jnp.float32)
+
+    height, width = train_images.shape[1], train_images.shape[2]
+    model = SimpleMLP(
+        height, width, num_classes, key=model_key, weight_scale=args.weight_scale
+    )
+
+    if OUTER_OPTIMIZER == "adam":
+        outer_opt = optax.adam(OUTER_LR)
+    else:
+        outer_opt = optax.sgd(OUTER_LR, momentum=0.9)
+
+    variance_key = jr.fold_in(data_key, 123)
+    variance_key, init_key = jr.split(variance_key)
+    init_keys = jr.split(init_key, args.num_inits)
+    init_params_list = []
+    for init_key in init_keys:
+        init_model = SimpleMLP(
+            height,
+            width,
+            num_classes,
+            key=init_key,
+            weight_scale=args.weight_scale,
+        )
+        init_params, _ = eqx.partition(init_model, eqx.is_inexact_array)
+        init_params_list.append(init_params)
+    init_params_batched = jax.tree_util.tree_map(
+        lambda *xs: jnp.stack(xs), *init_params_list
+    )
+
+    snapshot_steps = sorted({0, OUTER_STEPS // 2, OUTER_STEPS})
+    runs = []
+
+    for steps in [160]:
+        per_unroll_key = data_key
+        problem = GradientBasedHPO(
+            model=model,
+            train_data=(train_images, train_targets),
+            val_data=(val_images, val_targets),
+            num_steps=steps,
+            batch_size=args.inner_batch,
+            key=per_unroll_key,
+            weight_scale=args.weight_scale,
+            loss_interval=args.loss_interval,
+        )
+
+        outer_params = encode_hyperparams(INIT_LR)
+        snapshot_payloads: list[dict] = []
+        variance_state = {"key": variance_key}
+        seen_steps: set[int] = set()
+
+        def snapshot_callback(step: int, params: jax.Array) -> None:
+            if step not in snapshot_steps or step in seen_steps:
+                return
+            seen_steps.add(step)
+            variance_state["key"], sample_key = jr.split(variance_state["key"])
+            variances = compute_grad_variances(
+                problem,
+                params,
+                init_params_batched,
+                key=sample_key,
+                sigma=args.variance_sigma,
+                num_samples=args.variance_samples,
+                data_key=per_unroll_key,
+            )
+            lr_value = float(decode_hyperparams(params)[0])
+            snapshot_payloads.append(
+                {
+                    "step": int(step),
+                    "lr": lr_value,
+                    "variances": jnp.asarray(variances).tolist(),
+                }
+            )
+
+        run_outer_loop(
+            problem,
+            outer_params,
+            outer_opt,
+            data_key=per_unroll_key,
+            windowing=NO_WINDOWING,
+            method="raw",
+            outer_steps=OUTER_STEPS,
+            normalize_window_grads=args.normalize_window_grads,
+            different_init_each_outer_step=args.different_init_each_outer_step,
+            step_callback=snapshot_callback,
+            on_exists=on_exists,
+            run_label="variance",
+        )
+
+        runs.append(
+            {
+                "unroll_length": int(steps),
+                "snapshots": snapshot_payloads,
+            }
+        )
+
+    payload = {
+        "type": "variance_snapshots",
+        "timestamp": int(time.time()),
+        "run_id": run_id,
+        "method": "ours",
+        "snapshot_steps": snapshot_steps,
+        "outer_steps": OUTER_STEPS,
+        "unroll_lengths": unroll_lengths,
+        "variance_sigma": args.variance_sigma,
+        "variance_samples": args.variance_samples,
+        "num_inits": args.num_inits,
+        "weight_scale": args.weight_scale,
+        "loss_interval": args.loss_interval,
+        "inner_batch": args.inner_batch,
+        "different_init_each_outer_step": bool(args.different_init_each_outer_step),
+        "runs": runs,
+    }
+    path = save_json(payload, filename, on_exists=on_exists)
+    if path:
+        print(f"Saved variance snapshot results to {path}")
 
 
 def run_train_experiment(args):
@@ -493,7 +708,7 @@ def run_train_experiment(args):
         "inner_steps": INNER_STEPS,
         "weight_scale": args.weight_scale,
         "loss_interval": args.loss_interval,
-        "fixed_batch": bool(args.fixed_batch),
+        "different_init_each_outer_step": bool(args.different_init_each_outer_step),
     }
     run_id = stable_json_hash(run_config)
     on_exists = results_on_exists_policy(args)
@@ -521,7 +736,7 @@ def run_train_experiment(args):
 
     for steps in unroll_lengths:
         valid_windows = [w for w in windowings if 0 < w <= steps]
-        per_unroll_key = data_key if args.fixed_batch else jr.fold_in(data_key, steps)
+        per_unroll_key = data_key
         problem = GradientBasedHPO(
             model=model,
             train_data=(train_images, train_targets),
@@ -529,20 +744,23 @@ def run_train_experiment(args):
             num_steps=steps,
             batch_size=args.inner_batch,
             key=per_unroll_key,
+            weight_scale=args.weight_scale,
             loss_interval=args.loss_interval,
         )
 
         filename = f"train_{run_id}_ours_unroll{steps}.json"
         outer_params = encode_hyperparams(INIT_LR)
+
         run_outer_loop(
             problem,
             outer_params,
             outer_opt,
             data_key=per_unroll_key,
-            windowing=-1,
+            windowing=NO_WINDOWING,
             method="ours",
             outer_steps=OUTER_STEPS,
             normalize_window_grads=args.normalize_window_grads,
+            different_init_each_outer_step=args.different_init_each_outer_step,
             save_filename=filename,
             save_payload_fn=make_train_payload_fn(
                 run_id=run_id,
@@ -551,8 +769,8 @@ def run_train_experiment(args):
                 unroll_length=steps,
                 weight_scale=args.weight_scale,
                 loss_interval=args.loss_interval,
-                fixed_batch=bool(args.fixed_batch),
                 inner_batch=args.inner_batch,
+                different_init_each_outer_step=args.different_init_each_outer_step,
                 dummy=True,
             ),
             on_exists=on_exists,
@@ -571,6 +789,7 @@ def run_train_experiment(args):
                 method="windowing",
                 outer_steps=OUTER_STEPS,
                 normalize_window_grads=args.normalize_window_grads,
+                different_init_each_outer_step=args.different_init_each_outer_step,
                 save_filename=filename,
                 save_payload_fn=make_train_payload_fn(
                     run_id=run_id,
@@ -579,8 +798,8 @@ def run_train_experiment(args):
                     unroll_length=steps,
                     weight_scale=args.weight_scale,
                     loss_interval=args.loss_interval,
-                    fixed_batch=bool(args.fixed_batch),
                     inner_batch=args.inner_batch,
+                    different_init_each_outer_step=args.different_init_each_outer_step,
                 ),
                 on_exists=on_exists,
                 run_label="train",
@@ -596,6 +815,7 @@ def plot_results(args):
     os.makedirs(args.plot_dir, exist_ok=True)
     sns.set_theme(style="whitegrid")
     variance_runs = []
+    variance_snapshot_runs = []
     train_runs = []
 
     for path in files:
@@ -603,6 +823,8 @@ def plot_results(args):
             payload = json.load(f)
         if payload.get("type") == "variance":
             variance_runs.append(payload)
+        elif payload.get("type") == "variance_snapshots":
+            variance_snapshot_runs.append(payload)
         elif payload.get("type") == "train_hpo":
             train_runs.append(payload)
 
@@ -629,6 +851,26 @@ def plot_results(args):
         plt.savefig(out_path)
         plt.close()
         print(f"Wrote plot {out_path}")
+
+    for payload in variance_snapshot_runs:
+        for run in payload.get("runs", []):
+            unroll_length = run["unroll_length"]
+            for snapshot in run.get("snapshots", []):
+                step = snapshot["step"]
+                lr_value = snapshot.get("lr")
+                variances = jnp.array(snapshot.get("variances", []), dtype=jnp.float32)
+                title = (
+                    f"{payload.get('method', 'ours')} unroll={unroll_length} "
+                    f"step={step} lr={lr_value:.6f}"
+                    if lr_value is not None
+                    else None
+                )
+                out_path = os.path.join(
+                    args.plot_dir,
+                    f"variance_snapshot_{payload.get('run_id')}_unroll{unroll_length}_step{step}.png",
+                )
+                plot_variance_snapshot(variances, out_path=out_path, title=title)
+                print(f"Wrote plot {out_path}")
 
     def exp_moving_average(values: jax.Array, alpha: float = 0.2) -> jax.Array:
         if values.size == 0:
@@ -720,6 +962,7 @@ def run_hpo(args):
         num_steps=INNER_STEPS,
         batch_size=INNER_BATCH,
         key=data_key,
+        weight_scale=args.weight_scale,
         loss_interval=args.loss_interval,
     )
 
@@ -733,9 +976,16 @@ def run_hpo(args):
     outer_opt_state = outer_opt.init(outer_params)
 
     for step in range(OUTER_STEPS):
-        problem = problem.new()
-        val_loss, grads = problem.grad(windowing=args.windowing, expanded=True)(
-            outer_params, init_args=None
+        if args.different_init_each_outer_step:
+            data_key, step_key, init_key = jr.split(data_key, 3)
+            init_params = problem.sample_init_params(init_key)
+            init_args = (init_params,)
+        else:
+            data_key, step_key = jr.split(data_key)
+            init_args = None
+        problem_step = problem.new(key=step_key)
+        val_loss, grads = problem_step.grad(windowing=args.windowing, expanded=True)(
+            outer_params, init_args=init_args
         )
 
         grads_for_upd = grads.sum(axis=0)
@@ -772,8 +1022,13 @@ def build_parser():
     parser.add_argument(
         "--windowing",
         type=int,
-        default=-1,
-        help="truncate gradients every N steps (-1 for no truncation)",
+        default=NO_WINDOWING,
+        help="truncate gradients every N steps (use a huge number to avoid truncation)",
+    )
+    parser.add_argument(
+        "--different-init-each-outer-step",
+        action="store_true",
+        help="re-initialize the inner model parameters on every outer step",
     )
     parser.add_argument(
         "--loss-interval",
@@ -785,6 +1040,13 @@ def build_parser():
         "--run-variance-experiment",
         action="store_true",
         help="compute mean gradient variance across unroll lengths and save results",
+    )
+    parser.add_argument(
+        "--run-variance-snapshots-experiment",
+        action="store_true",
+        help=(
+            "track gradient variance snapshots during HPO and save results for plotting"
+        ),
     )
     parser.add_argument(
         "--run-train-experiment",
@@ -817,7 +1079,7 @@ def build_parser():
     parser.add_argument(
         "--windowings",
         type=str,
-        default="10,20,40,80,160",
+        default="10,20,40,80,160,320,640",
         help="comma-separated list of window sizes for truncated gradients",
     )
     parser.add_argument(
@@ -831,11 +1093,6 @@ def build_parser():
         type=float,
         default=0.01,
         help="stddev for Gaussian smoothing of outer parameters",
-    )
-    parser.add_argument(
-        "--fixed-batch",
-        action="store_true",
-        help="use a fixed RNG key so batch sequence is identical across unrolls",
     )
     parser.add_argument(
         "--normalize-window-grads",
@@ -915,7 +1172,7 @@ class Problem(eqx.Module):
 
     def grad(
         self,
-        windowing: int = -1,
+        windowing: int = NO_WINDOWING,
         expanded: bool = False,
         filter=eqx.is_inexact_array,
         ours_simple: bool = False,
@@ -987,7 +1244,7 @@ class Problem(eqx.Module):
             # the loop for scan: a single node in the dependency graph
             def body(state, xs_i):
                 stepwise_aux, step_idx = xs_i
-                if windowing != -1:
+                if windowing != NO_WINDOWING:
                     state = jax.lax.cond(
                         jnp.mod(step_idx, windowing) == 0,
                         lambda: jax.lax.stop_gradient(state),
@@ -1034,7 +1291,7 @@ class Problem(eqx.Module):
 
                 # Apply windowing: zero out grad_for_state AFTER vjp to truncate gradient flow
                 # This prevents gradients from flowing to earlier timesteps at window boundaries
-                if windowing != -1:
+                if windowing != NO_WINDOWING:
                     grad_for_state = jax.lax.cond(
                         jnp.mod(step_idx, windowing) == 0,
                         lambda gs: jax.tree.map(jnp.zeros_like, gs),
@@ -1083,6 +1340,7 @@ class GradientBasedHPO(Problem):
     data_key: jax.Array
     max_steps: int = eqx.field(static=True)
     batch_size: int = eqx.field(static=True)
+    weight_scale: float = eqx.field(static=True)
     loss_interval: int = eqx.field(static=True)
 
     def __init__(
@@ -1093,6 +1351,7 @@ class GradientBasedHPO(Problem):
         num_steps: int,
         batch_size: int,
         key: jax.Array,
+        weight_scale: float = 1.0,
         loss_interval: int = LOSS_INTERVAL,
     ):
         params, static = eqx.partition(model, eqx.is_inexact_array)
@@ -1103,7 +1362,21 @@ class GradientBasedHPO(Problem):
         self.data_key = key
         self.max_steps = num_steps
         self.batch_size = batch_size
+        self.weight_scale = weight_scale
         self.loss_interval = loss_interval
+
+    def sample_init_params(self, key: jax.Array):
+        height, width = self.train_inputs.shape[1], self.train_inputs.shape[2]
+        num_classes = self.train_targets.shape[-1]
+        model = SimpleMLP(
+            height,
+            width,
+            num_classes,
+            key=key,
+            weight_scale=self.weight_scale,
+        )
+        params, _ = eqx.partition(model, eqx.is_inexact_array)
+        return params
 
     def new(self, key: jax.Array | None = None) -> "GradientBasedHPO":
         if key is None:
@@ -1167,7 +1440,7 @@ if __name__ == "__main__":
     else:
         if args.run_variance_experiment:
             run_variance_experiment(args)
+        if args.run_variance_snapshots_experiment:
+            run_variance_snapshots_experiment(args)
         if args.run_train_experiment:
             run_train_experiment(args)
-        if not args.run_variance_experiment and not args.run_train_experiment:
-            run_hpo(args)
