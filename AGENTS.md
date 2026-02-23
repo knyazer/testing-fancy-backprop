@@ -226,6 +226,18 @@ def shard_module(module: ShardableModule):
         ...
 ```
 
+```python
+# Bad: message is non informative and contains trivial details
+def test_decode_one_token():
+    skip_on_gpu("Skip on GPU due to token mismatch in test_decode_one_token.")
+    ...
+
+# Good: message describes the reasoning
+def test_decode_one_token():
+    skip_on_gpu("Flaky on GPU due to torch/jax precision inconsistencies.")
+    ...
+```
+
 Some well-written code of mine:
 
 ```python

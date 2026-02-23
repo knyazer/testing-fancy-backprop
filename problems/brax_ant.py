@@ -9,7 +9,7 @@ import optax
 
 from brax import envs as brax_envs
 
-from problem import Problem
+from problems.base import Problem, ProblemSpec
 
 
 class PolicyMLP(eqx.Module):
@@ -130,8 +130,37 @@ class BraxAntProblem(Problem):
         return jnp.zeros((self.max_steps,))
 
 
+class BraxAntSpec(ProblemSpec):
+    _hidden_size: int
+    _env_name: str
+
+    def __init__(self, *, hidden_size: int = 64, env_name: str = "ant"):
+        super().__init__(name="brax_ant")
+        self._hidden_size = hidden_size
+        self._env_name = env_name
+
+    def build(self, *, num_steps: int, key: jax.Array) -> BraxAntProblem:
+        return BraxAntProblem(
+            num_steps=num_steps,
+            hidden_size=self._hidden_size,
+            key=key,
+            env_name=self._env_name,
+        )
+
+    def default_outer_params(self, *, key: jax.Array) -> Any:
+        problem = self.build(num_steps=1, key=key)
+        return problem.initial_policy_params
+
+    def describe_outer_params(self, params: Any) -> str:
+        n = sum(int(jnp.size(p)) for p in jax.tree.leaves(params))
+        return f"policy params ({n} params)"
+
+    def outer_optimizer(self) -> optax.GradientTransformation:
+        return optax.chain(optax.clip_by_global_norm(1.0), optax.adam(1e-3))
+
+
 if __name__ == "__main__":
-    key = jr.PRNGKey(0)
+    key = jr.key(0)
 
     print("Initializing Brax Ant problem...")
     problem = BraxAntProblem(key=key)

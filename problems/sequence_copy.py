@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import optax
 
-from problem import Problem
+from problems.base import Problem, ProblemSpec
 
 
 class RNNCopyCell(eqx.Module):
@@ -52,10 +52,57 @@ class RNNCopyCell(eqx.Module):
         return new_hidden, output_logits
 
 
+class LinearRNNCopyCell(eqx.Module):
+    """Linear RNN cell (no activation). Uses scaled init so spectral radius > 1."""
+
+    input_to_hidden: nn.Linear
+    hidden_to_hidden: nn.Linear
+    hidden_to_output: nn.Linear
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        output_size: int,
+        *,
+        key: jax.Array,
+    ):
+        k1, k2, k3 = jr.split(key, 3)
+        self.input_to_hidden = nn.Linear(input_size, hidden_size, key=k1)
+        self.hidden_to_hidden = nn.Linear(hidden_size, hidden_size, key=k2)
+        self.hidden_to_output = nn.Linear(hidden_size, output_size, key=k3)
+        # Normalize hidden-to-hidden so spectral radius is exactly 1.05
+        # (even slightly > 1 causes dramatic gradient explosion at long horizons)
+        W = self.hidden_to_hidden.weight
+        spectral_radius = jnp.max(jnp.abs(jnp.linalg.eigvals(W)))
+        self.hidden_to_hidden = eqx.tree_at(
+            lambda m: m.weight,
+            self.hidden_to_hidden,
+            W * (1.05 / spectral_radius),
+        )
+
+    def __call__(self, hidden: jax.Array, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+        new_hidden = self.input_to_hidden(x) + self.hidden_to_hidden(hidden)
+        output_logits = self.hidden_to_output(new_hidden)
+        return new_hidden, output_logits
+
+
 class RNNCopyState(eqx.Module):
     hidden: jax.Array  # (hidden_size,)
     output: jax.Array  # (vocab_size,) logits from last step
     step: jax.Array
+
+
+def _make_rnn_cell(
+    input_size: int,
+    hidden_size: int,
+    output_size: int,
+    *,
+    key: jax.Array,
+    linear: bool = False,
+) -> RNNCopyCell | LinearRNNCopyCell:
+    cell_cls = LinearRNNCopyCell if linear else RNNCopyCell
+    return cell_cls(input_size, hidden_size, output_size, key=key)
 
 
 class SequenceCopyProblem(Problem):
@@ -69,6 +116,7 @@ class SequenceCopyProblem(Problem):
     vocab_size: int = eqx.field(static=True)
     hidden_size: int = eqx.field(static=True)
     loss_interval: int = eqx.field(static=True)
+    linear: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -78,16 +126,18 @@ class SequenceCopyProblem(Problem):
         hidden_size: int = 64,
         key: jax.Array,
         loss_interval: int = 1,
+        linear: bool = False,
     ):
         self.seq_length = seq_length
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.max_steps = 2 * seq_length
         self.loss_interval = loss_interval
+        self.linear = linear
 
         key, rnn_key, seq_key = jr.split(key, 3)
 
-        rnn = RNNCopyCell(vocab_size, hidden_size, vocab_size, key=rnn_key)
+        rnn = _make_rnn_cell(vocab_size, hidden_size, vocab_size, key=rnn_key, linear=linear)
         params, static = eqx.partition(rnn, eqx.is_inexact_array)
         self.initial_rnn_params = params
         self.rnn_static = static
@@ -99,8 +149,10 @@ class SequenceCopyProblem(Problem):
         self.data_key = key
 
     def sample_init_params(self, key: jax.Array):
-        """Generate randomly initialized RNN weights."""
-        rnn = RNNCopyCell(self.vocab_size, self.hidden_size, self.vocab_size, key=key)
+        rnn = _make_rnn_cell(
+            self.vocab_size, self.hidden_size, self.vocab_size,
+            key=key, linear=self.linear,
+        )
         params, _ = eqx.partition(rnn, eqx.is_inexact_array)
         return params
 
@@ -172,8 +224,48 @@ class SequenceCopyProblem(Problem):
         return jnp.concatenate([encoding_inputs, decoding_inputs], axis=0)
 
 
+class SequenceCopySpec(ProblemSpec):
+    _vocab_size: int
+    _hidden_size: int
+    _linear: bool
+
+    def __init__(
+        self,
+        *,
+        vocab_size: int = 8,
+        hidden_size: int = 32,
+        linear: bool = False,
+        name: str | None = None,
+    ):
+        super().__init__(name=name or ("linear_rnn_copy" if linear else "sequence_copy"))
+        self._vocab_size = vocab_size
+        self._hidden_size = hidden_size
+        self._linear = linear
+
+    def build(self, *, num_steps: int, key: jax.Array) -> SequenceCopyProblem:
+        seq_length = num_steps // 2
+        return SequenceCopyProblem(
+            seq_length=seq_length,
+            vocab_size=self._vocab_size,
+            hidden_size=self._hidden_size,
+            key=key,
+            linear=self._linear,
+        )
+
+    def default_outer_params(self, *, key: jax.Array) -> Any:
+        problem = self.build(num_steps=2, key=key)
+        return problem.initial_rnn_params
+
+    def describe_outer_params(self, params: Any) -> str:
+        n = sum(int(jnp.size(p)) for p in jax.tree.leaves(params))
+        return f"rnn params ({n} params)"
+
+    def outer_optimizer(self) -> optax.GradientTransformation:
+        return optax.chain(optax.clip_by_global_norm(1.0), optax.adam(1e-2))
+
+
 if __name__ == "__main__":
-    key = jr.PRNGKey(0)
+    key = jr.key(0)
 
     print("Initializing sequence copy problem...")
     problem = SequenceCopyProblem(seq_length=100, vocab_size=8, hidden_size=32, key=key)

@@ -1,10 +1,39 @@
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import optax
+from jaxtyping import Array, Key
 
 NO_WINDOWING = 1_000_000_000
+
+
+@dataclass(frozen=True)
+class ProblemSpec(ABC):
+    name: str
+
+    @abstractmethod
+    def build(self, *, num_steps: int, key: Key[Array, ""]) -> "Problem":
+        ...
+
+    @abstractmethod
+    def default_outer_params(self, *, key: Key[Array, ""]) -> Any:
+        ...
+
+    def project_outer_params(self, params: Any) -> Any:
+        return params
+
+    def describe_outer_params(self, params: Any) -> str:
+        return ""
+
+    def sample_init_params(self, *, key: Key[Array, ""]) -> Any | None:
+        return None
+
+    def outer_optimizer(self) -> optax.GradientTransformation:
+        return optax.sgd(1e-2)
 
 
 class Problem(eqx.Module):
@@ -52,6 +81,9 @@ class Problem(eqx.Module):
         ours_simple: bool = False,
         ours_lambda: float = 0.95,
     ):
+        if expanded and ours_simple:
+            raise ValueError("expanded=True is not compatible with ours_simple=True")
+
         def fn(
             params: eqx.Module,
             init_args: Any = None,

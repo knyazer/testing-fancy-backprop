@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import optax
 
-from problem import Problem
+from problems.base import Problem, ProblemSpec
 
 
 class SimpleMLP(eqx.Module):
@@ -205,3 +205,85 @@ class GradientBasedHPO(Problem):
         new_step = state.step + 1
 
         return TrainState(params=new_params, step=new_step), None
+
+
+def _load_mnist_data(
+    num_train: int = 4000, num_val: int = 100
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    train_images, train_labels, val_images, val_labels = load_mnist_arrays(
+        num_train, num_val
+    )
+    num_classes = int(jnp.max(train_labels) - jnp.min(train_labels)) + 1
+    train_images = preprocess_images(train_images)
+    train_targets = jax.nn.one_hot(train_labels, num_classes, dtype=jnp.float32)
+    val_images = preprocess_images(val_images)
+    val_targets = jax.nn.one_hot(val_labels, num_classes, dtype=jnp.float32)
+    return train_images, train_targets, val_images, val_targets
+
+
+class HPOSpec(ProblemSpec):
+    _key: jax.Array
+    _weight_scale: float
+    _batch_size: int
+    _init_lr: float
+    _data: tuple[jax.Array, jax.Array, jax.Array, jax.Array] | None
+
+    def __init__(
+        self,
+        *,
+        key: jax.Array | None = None,
+        weight_scale: float = 1.0,
+        batch_size: int = 32,
+        init_lr: float = 0.5,
+    ):
+        super().__init__(name="hpo")
+        self._key = key if key is not None else jr.key(0)
+        self._weight_scale = weight_scale
+        self._batch_size = batch_size
+        self._init_lr = init_lr
+        self._data = None
+
+    def _ensure_data(self) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        if self._data is None:
+            object.__setattr__(self, "_data", _load_mnist_data())
+        return self._data
+
+    def _model_key(self) -> jax.Array:
+        _, model_key = jr.split(self._key)
+        return model_key
+
+    def _make_model(self, key: jax.Array) -> SimpleMLP:
+        train_images, train_targets, _, _ = self._ensure_data()
+        height, width = train_images.shape[1], train_images.shape[2]
+        num_classes = train_targets.shape[-1]
+        return SimpleMLP(
+            height, width, num_classes, key=key, weight_scale=self._weight_scale
+        )
+
+    def build(self, *, num_steps: int, key: jax.Array) -> GradientBasedHPO:
+        train_images, train_targets, val_images, val_targets = self._ensure_data()
+        model = self._make_model(self._model_key())
+        return GradientBasedHPO(
+            model=model,
+            train_data=(train_images, train_targets),
+            val_data=(val_images, val_targets),
+            num_steps=num_steps,
+            batch_size=self._batch_size,
+            key=key,
+            weight_scale=self._weight_scale,
+        )
+
+    def default_outer_params(self, *, key: jax.Array) -> jax.Array:
+        return encode_hyperparams(self._init_lr)
+
+    def project_outer_params(self, params: jax.Array) -> jax.Array:
+        return project_hyperparams(params)
+
+    def describe_outer_params(self, params: jax.Array) -> str:
+        (lr,) = decode_hyperparams(params)
+        return f"lr={float(lr):.6f}"
+
+    def sample_init_params(self, *, key: jax.Array) -> Any:
+        model = self._make_model(key)
+        params, _ = eqx.partition(model, eqx.is_inexact_array)
+        return params
