@@ -1,164 +1,273 @@
 import argparse
 import json
 import os
+from collections import defaultdict
 
-import jax
-import jax.numpy as jnp
+import numpy as np
 import seaborn as sns
 from matplotlib import pyplot as plt
 
 from run import RESULTS_DIR, list_result_files
 
+OURS_METHODS = ["ours_0.70", "ours_0.80", "ours_0.90", "ours_0.95", "ours_0.98", "ours_0.99"]
+WINDOW_METHODS = ["window_3", "window_5", "window_10", "window_20", "window_50", "window_100"]
 
-def exp_moving_average(values: jax.Array, alpha: float = 0.2) -> jax.Array:
-    if values.size == 0:
-        return values
-    init = values[0]
-
-    def body(avg, x):
-        avg = alpha * x + (1.0 - alpha) * avg
-        return avg, avg
-
-    _, smoothed = jax.lax.scan(body, init, values[1:])
-    return jnp.concatenate([jnp.array([init]), smoothed])
+OURS_CMAP = plt.cm.Reds
+WINDOW_CMAP = plt.cm.Blues
 
 
-def plot_variance_snapshot(
-    variances: jax.Array, *, out_path: str, title: str | None = None
-) -> None:
-    if variances.size == 0:
-        return
-    xs = jnp.arange(variances.shape[0])
-    plt.figure()
-    plt.scatter(xs, variances, color="orange", alpha=0.6)
-    median = jnp.median(variances)
-    plt.axhline(median, color="black", linewidth=2.0)
-    plt.yscale("log")
-    plt.xlabel("init index")
-    plt.ylabel("gradient variance")
-    if title:
-        plt.title(title)
-    plt.savefig(out_path)
-    plt.close()
+def _method_color(name: str) -> str:
+    if name == "raw":
+        return "black"
+    ours_list = OURS_METHODS
+    window_list = WINDOW_METHODS
+    if name in ours_list:
+        idx = ours_list.index(name)
+        return OURS_CMAP(0.3 + 0.6 * idx / max(len(ours_list) - 1, 1))
+    if name in window_list:
+        idx = window_list.index(name)
+        return WINDOW_CMAP(0.3 + 0.6 * idx / max(len(window_list) - 1, 1))
+    return "gray"
 
 
-def plot_results(plot_dir: str) -> None:
-    files = list_result_files()
-    if not files:
-        print("No results found to plot.")
-        return
+def _method_style(name: str) -> str:
+    if name.startswith("ours_"):
+        return "-"
+    if name.startswith("window_"):
+        return "--"
+    return "-."
 
-    os.makedirs(plot_dir, exist_ok=True)
-    sns.set_theme(style="whitegrid")
-    variance_runs: list[dict] = []
-    variance_snapshot_runs: list[dict] = []
-    train_runs: list[dict] = []
 
-    for path in files:
+def _load_results_by_type() -> dict[str, list[dict]]:
+    by_type: dict[str, list[dict]] = defaultdict(list)
+    for path in list_result_files():
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
-        if payload.get("type") == "variance":
-            variance_runs.append(payload)
-        elif payload.get("type") == "variance_snapshots":
-            variance_snapshot_runs.append(payload)
-        elif payload.get("type") == "train_hpo":
-            train_runs.append(payload)
+        rtype = payload.get("type", "unknown")
+        by_type[rtype].append(payload)
+    return by_type
 
-    for payload in variance_runs:
-        unroll_lengths = payload["unroll_lengths"]
-        variances = jnp.array(payload["variances"])
-        if variances.size == 0:
+
+def _latest_by_problem(runs: list[dict]) -> dict[str, dict]:
+    by_problem: dict[str, dict] = {}
+    for run in runs:
+        problem = run.get("problem")
+        if problem is None:
             continue
-        plt.figure()
-        for idx in range(variances.shape[0]):
-            plt.plot(unroll_lengths, variances[idx], color="orange", alpha=0.1)
-        median_curve = jnp.median(variances, axis=0)
-        plt.plot(unroll_lengths, median_curve, color="black", linewidth=2.0)
-        plt.yscale("log")
-        median_valid = median_curve[~jnp.isnan(median_curve)]
-        if median_valid.size > 0:
-            median_min = float(jnp.min(median_valid))
-            median_max = float(jnp.max(median_valid))
-            plt.ylim(median_min / 10.0, median_max * 1000.0)
-        plt.xlabel("unroll length")
-        plt.ylabel("gradient variance at random init")
-        ts = payload.get("timestamp", "unknown")
-        out_path = os.path.join(plot_dir, f"variance_{ts}.png")
-        plt.savefig(out_path)
-        plt.close()
-        print(f"Wrote plot {out_path}")
+        if problem not in by_problem or run.get("timestamp", 0) > by_problem[problem].get("timestamp", 0):
+            by_problem[problem] = run
+    return by_problem
 
-    for payload in variance_snapshot_runs:
-        for run in payload.get("runs", []):
-            unroll_length = run["unroll_length"]
-            for snapshot in run.get("snapshots", []):
-                step = snapshot["step"]
-                lr_value = snapshot.get("lr")
-                variances = jnp.array(
-                    snapshot.get("variances", []), dtype=jnp.float32
-                )
-                title = (
-                    f"{payload.get('method', 'ours')} unroll={unroll_length} "
-                    f"step={step} lr={lr_value:.6f}"
-                    if lr_value is not None
-                    else None
-                )
-                out_path = os.path.join(
-                    plot_dir,
-                    f"variance_snapshot_{payload.get('run_id')}_unroll{unroll_length}_step{step}.png",
-                )
-                plot_variance_snapshot(variances, out_path=out_path, title=title)
-                print(f"Wrote plot {out_path}")
 
-    if train_runs:
-        by_unroll: dict[int, list[dict]] = {}
-        for run in train_runs:
-            by_unroll.setdefault(run["unroll_length"], []).append(run)
-        for unroll, runs in sorted(by_unroll.items()):
-            plt.figure()
-            for run in runs:
-                label = run["method"]
-                if run["method"] == "windowing":
-                    label = f"window={run['windowing']}"
-                plt.plot(run["losses"], label=label)
-            plt.xlabel("outer step")
-            plt.ylabel("meta loss")
-            plt.legend()
-            out_path = os.path.join(plot_dir, f"train_unroll_{unroll}.png")
-            plt.savefig(out_path)
-            plt.close()
-            print(f"Wrote plot {out_path}")
+def plot_grad_norms(plot_dir: str, grad_norm_runs: list[dict]) -> None:
+    by_problem = _latest_by_problem(grad_norm_runs)
 
-            plt.figure()
-            grad_by_label: dict[str, list[jax.Array]] = {}
-            for run in runs:
-                label = run["method"]
-                if run["method"] == "windowing":
-                    label = f"window={run['windowing']}"
-                grad_norms = jnp.array(
-                    run.get("grad_norms", []), dtype=jnp.float32
-                )
-                if grad_norms.size == 0:
-                    continue
-                smoothed = exp_moving_average(grad_norms)
-                grad_by_label.setdefault(label, []).append(smoothed)
-            for label, curves in grad_by_label.items():
-                min_len = min(curve.size for curve in curves)
-                if min_len == 0:
-                    continue
-                stacked = jnp.stack([curve[:min_len] for curve in curves])
-                mean_curve = jnp.mean(stacked, axis=0)
-                plt.plot(mean_curve, label=label, linewidth=2.0)
-            plt.xlabel("outer step")
-            plt.ylabel("grad norm")
-            plt.yscale("log")
-            plt.legend()
-            out_path = os.path.join(
-                plot_dir, f"train_unroll_{unroll}_gradnorms.png"
+    for problem, payload in sorted(by_problem.items()):
+        unroll_lengths = payload["unroll_lengths"]
+        methods = payload["methods"]
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for method_name, data in sorted(methods.items()):
+            mean_norms = np.array(data["mean_norms"])
+            valid = ~np.isnan(mean_norms)
+            if not np.any(valid):
+                continue
+            ax.plot(
+                np.array(unroll_lengths)[valid],
+                mean_norms[valid],
+                label=method_name,
+                color=_method_color(method_name),
+                linestyle=_method_style(method_name),
+                linewidth=2,
+                marker="o",
+                markersize=4,
             )
-            plt.savefig(out_path)
-            plt.close()
-            print(f"Wrote plot {out_path}")
+
+        ax.set_yscale("log")
+        ax.set_xlabel("Unroll length")
+        ax.set_ylabel("Mean gradient norm")
+        ax.set_title(f"Gradient Norms — {problem}")
+        ax.legend(fontsize=7, ncol=2)
+        out_path = os.path.join(plot_dir, f"grad_norms_{problem}.pdf")
+        fig.savefig(out_path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Wrote {out_path}")
+
+
+def _loss_series(run: dict) -> list[float]:
+    """Return eval_losses if available, otherwise training losses."""
+    eval_losses = run.get("eval_losses", [])
+    return eval_losses if eval_losses else run["losses"]
+
+
+def _untrained_loss(training_runs: list[dict], problem: str) -> float | None:
+    """Extract the untrained model loss (step-0 loss) for a given problem."""
+    for run in training_runs:
+        if run.get("problem") == problem and run["method"] == "raw" and run.get("losses"):
+            series = _loss_series(run)
+            return series[0]
+    return None
+
+
+def _aggregate_best_losses(
+    training_runs: list[dict],
+) -> dict[str, dict[str, dict[int, float]]]:
+    current_runs = [r for r in training_runs if r.get("outer_optimizer", "?") != "?"]
+    by_problem: dict[str, dict[str, dict[int, float]]] = defaultdict(lambda: defaultdict(dict))
+    for run in current_runs:
+        problem = run["problem"]
+        method = run["method"]
+        unroll = run["unroll_length"]
+        best = min(_loss_series(run))
+        existing = by_problem[problem][method].get(unroll)
+        if existing is None or best < existing:
+            by_problem[problem][method][unroll] = best
+    return by_problem
+
+
+def _plot_best_loss_family(
+    ax: plt.Axes,
+    methods_data: dict[str, dict[int, float]],
+    family_methods: list[str],
+    problem: str,
+    untrained: float | None,
+) -> None:
+    # Always include raw as baseline
+    for method_name in ["raw"] + family_methods:
+        unroll_losses = methods_data.get(method_name)
+        if unroll_losses is None:
+            continue
+        unrolls = sorted(unroll_losses.keys())
+        losses = [unroll_losses[u] for u in unrolls]
+        valid = [(u, l) for u, l in zip(unrolls, losses) if not np.isnan(l)]
+        if not valid:
+            continue
+        us, ls = zip(*valid)
+        ax.plot(
+            us, ls,
+            label=method_name,
+            color=_method_color(method_name),
+            linestyle=_method_style(method_name),
+            linewidth=2,
+            marker="o",
+            markersize=4,
+        )
+
+    if untrained is not None and not np.isnan(untrained):
+        ax.axhline(untrained, color="gray", linestyle=":", linewidth=1.5,
+                    label=f"untrained ({untrained:.2f})")
+
+    if problem == "linear_rnn_copy":
+        ax.set_yscale("log")
+
+    ax.set_xlabel("Unroll length")
+    ax.set_ylabel("Best loss achieved")
+
+
+def plot_training_best_loss(plot_dir: str, training_runs: list[dict]) -> None:
+    by_problem = _aggregate_best_losses(training_runs)
+
+    for problem, methods_data in sorted(by_problem.items()):
+        untrained = _untrained_loss(training_runs, problem)
+
+        for family_name, family_methods in [("ours", OURS_METHODS), ("window", WINDOW_METHODS)]:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            _plot_best_loss_family(ax, methods_data, family_methods, problem, untrained)
+            ax.set_title(f"Training Performance — {problem} ({family_name})")
+            ax.legend(fontsize=7, ncol=2)
+            out_path = os.path.join(plot_dir, f"training_best_loss_{problem}_{family_name}.pdf")
+            fig.savefig(out_path, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Wrote {out_path}")
+
+
+def plot_training_curves(plot_dir: str, training_runs: list[dict]) -> None:
+    current_runs = [r for r in training_runs if r.get("outer_optimizer", "?") != "?"]
+
+    by_problem_unroll: dict[tuple[str, int], list[dict]] = defaultdict(list)
+    for run in current_runs:
+        by_problem_unroll[(run["problem"], run["unroll_length"])].append(run)
+
+    for (problem, unroll), runs in sorted(by_problem_unroll.items()):
+        for family_name, family_methods in [("ours", OURS_METHODS), ("window", WINDOW_METHODS)]:
+            fig, ax = plt.subplots(figsize=(8, 5))
+            for run in sorted(runs, key=lambda r: r["method"]):
+                method = run["method"]
+                if method != "raw" and method not in family_methods:
+                    continue
+                losses = np.array(_loss_series(run))
+                ax.plot(
+                    losses,
+                    label=method,
+                    color=_method_color(method),
+                    linestyle=_method_style(method),
+                    linewidth=1.5,
+                    alpha=0.8,
+                )
+
+            ax.set_xlabel("Outer step")
+            ax.set_ylabel("Loss")
+            ax.set_title(f"Training Curves — {problem}, unroll={unroll} ({family_name})")
+            ax.legend(fontsize=6, ncol=2)
+            out_path = os.path.join(plot_dir, f"training_curves_{problem}_unroll{unroll}_{family_name}.pdf")
+            fig.savefig(out_path, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Wrote {out_path}")
+
+
+def plot_gradient_profile(plot_dir: str, profile_runs: list[dict]) -> None:
+    for payload in profile_runs:
+        problem = payload["problem"]
+        unroll = payload["unroll_length"]
+        methods = payload["methods"]
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for method_name, data in sorted(methods.items()):
+            mean_norms = np.array(data["per_step_mean_norms"])
+            std_norms = np.array(data["per_step_std_norms"])
+            steps = np.arange(len(mean_norms))
+
+            ax.plot(
+                steps, mean_norms,
+                label=method_name,
+                color=_method_color(method_name),
+                linestyle=_method_style(method_name),
+                linewidth=1.5,
+            )
+            ax.fill_between(
+                steps,
+                np.maximum(mean_norms - std_norms, 1e-10),
+                mean_norms + std_norms,
+                color=_method_color(method_name),
+                alpha=0.1,
+            )
+
+        ax.set_yscale("log")
+        ax.set_xlabel("Time step")
+        ax.set_ylabel("Per-step gradient norm")
+        ax.set_title(f"Gradient Profile — {problem}, unroll={unroll}")
+        ax.legend(fontsize=7)
+        out_path = os.path.join(plot_dir, f"gradient_profile_{problem}_unroll{unroll}.pdf")
+        fig.savefig(out_path, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Wrote {out_path}")
+
+
+def plot_all(plot_dir: str) -> None:
+    os.makedirs(plot_dir, exist_ok=True)
+    sns.set_theme(style="whitegrid")
+
+    by_type = _load_results_by_type()
+
+    if "eval_grad_norms" in by_type:
+        plot_grad_norms(plot_dir, by_type["eval_grad_norms"])
+
+    if "eval_training" in by_type:
+        plot_training_best_loss(plot_dir, by_type["eval_training"])
+        plot_training_curves(plot_dir, by_type["eval_training"])
+
+    if "eval_gradient_profile" in by_type:
+        plot_gradient_profile(plot_dir, by_type["eval_gradient_profile"])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -174,4 +283,4 @@ def build_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    plot_results(args.plot_dir)
+    plot_all(args.plot_dir)
